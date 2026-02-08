@@ -893,15 +893,17 @@ test "eval with assignments" {
     const gpa = debug.allocator();
 
     const expect = struct {
-        fn expect(alloc: Allocator, input: []const u8, expected: Ast) !void {
+        fn expect(alloc: Allocator, gc: *Ast.GC, input: []const u8, expected: []const u8) !void {
             var writer_buf: [8192]u8 = undefined;
             var w = std.Io.Writer.fixed(&writer_buf);
 
-            const parsed = try parse(alloc, input) orelse return error.Unexpected;
-            if (!std.mem.eql(u8, @tagName(parsed), "expression")) return error.Unexpected;
+            const parsed_mut = try parseMutable(alloc, gc, input) orelse return error.Unexpected;
 
-            var ast, _ = parsed.expression;
-            defer ast.deinit(alloc);
+            if (std.mem.eql(u8, @tagName(parsed_mut), "assignment")) return error.UnexpectedAssignment;
+
+            const ref, _ = parsed_mut.expression;
+            var ast = Ast{ .root_ref = ref, .gc = gc.* };
+            defer gc.* = ast.gc;
 
             var res = try ast.eval(alloc) orelse return error.Unexpected;
             const printable = try res.printable(alloc, &ast.gc);
@@ -910,70 +912,60 @@ test "eval with assignments" {
             const got_end = w.end;
             const got = writer_buf[0..got_end];
 
-            try w.print("{f}", .{expected});
-            const exp = writer_buf[got_end..w.end];
-            try std.testing.expectEqualStrings(exp, got);
+            try std.testing.expectEqualStrings(expected, got);
         }
     }.expect;
 
     var ast = Ast.init(gpa);
-    errdefer ast.deinit(gpa);
+    defer ast.deinit(gpa);
 
     var input: []const u8 =
-        \\ true = \x.y.x
+        \\ true = \x.y.x
     ;
     _ = try parseMutable(gpa, &ast.gc, input);
 
     input =
-        \\ false = \x.y.y
+        \\ false = \x.y.y
     ;
     _ = try parseMutable(gpa, &ast.gc, input);
 
     input =
-        \\ if = \x.x
+        \\ if = \x.x
     ;
     _ = try parseMutable(gpa, &ast.gc, input);
 
     input =
-        \\ pair = \x.y.f.f x y
+        \\ pair = \x.y.f.f x y
     ;
     _ = try parseMutable(gpa, &ast.gc, input);
 
     input =
-        \\ fst = \p.p true
+        \\ fst = \p.p true
     ;
     _ = try parseMutable(gpa, &ast.gc, input);
 
     input =
-        \\ snd = \p.p false
+        \\ snd = \p.p false
     ;
     _ = try parseMutable(gpa, &ast.gc, input);
 
     input =
         \\ if true 12 13
     ;
-    ast.root_ref = try ast.gc.make(gpa, .{ .variable = "12" });
-    try expect(gpa, input, ast);
-    ast.clear(gpa);
+    try expect(gpa, &ast.gc, input, "12");
 
     input =
         \\ if false 12 13
     ;
-    ast.root_ref = try ast.gc.make(gpa, .{ .variable = "13" });
-    try expect(gpa, input, ast);
-    ast.clear(gpa);
+    try expect(gpa, &ast.gc, input, "13");
 
     input =
         \\ fst (pair 33 34)
     ;
-    ast.root_ref = try ast.gc.make(gpa, .{ .variable = "33" });
-    try expect(gpa, input, ast);
-    ast.clear(gpa);
+    try expect(gpa, &ast.gc, input, "33");
 
     input =
-        \\ snd (fst (pair 33 (pair 12 13))
+        \\ snd (snd (pair 33 (pair 12 13)))
     ;
-    ast.root_ref = try ast.gc.make(gpa, .{ .variable = "13" });
-    try expect(gpa, input, ast);
-    ast.clear(gpa);
+    try expect(gpa, &ast.gc, input, "13");
 }
