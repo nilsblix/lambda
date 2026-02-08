@@ -1,84 +1,3 @@
-// Single file REPL for a Lambda Calculus interpreter.
-//
-// ### Syntax:
-//
-// A *variable* is some sequence of characters. For example: `\x.y` denotes a
-// function where the argument is a variable `x` and returns a variable `y`.
-// Variables can be any length, and can overload semantic tokens by wrapping
-// the variable name in @"...". Examples:
-//
-// `x`, `var`, `anything`, `@"some variable"`, `@"\wow.\is this a variable?"`.
-//
-// A *function* takes the form: `\x.y` where the `x` variable is the function's
-// argument, and `y` is the returned expression. Note that `y` doesn't have to
-// be a variable, which enables important functional concepts, such as
-// currying. Examples:
-//
-// `\x.x`         - x -> x (the id function)
-// `\x.y`         - x -> y
-// `\x.y.z`       - x, y -> z
-// `\x.y.f.f x y` - When applied to two arguments, it creates a pair.
-//
-// An *application* of a function takes the form: `(f x)` where `f` is the
-// function to apply the argument `x` to. Applications are usually
-// syntactically similar to S-expressions, with the notable exceptions of being
-// inside function returns, such as in the Pair example above, where `f x y` in
-// the function return is an application of `f` with the arguments `x` and `y`.
-// Examples:
-//
-// `(f x)`   - f(x)
-// `(g x y)` - g(x, y). Note that `g` has to be defined as a curried function,
-// i.e `g = \x.y.z`, thus making `(g x)` equal to `\y.z`.
-//
-//
-// ### Examples
-//
-// With this system, we can define simple types, such as booleans:
-//
-// `true = \x.y.x`
-// `false = \x.y.y`.
-//
-// But, why does these two functions behave as booleans? Lets try to use them
-// in some if/else statement. But first lets introduce an `if` function.
-//
-// `if = \x.x` (i.e the id function)
-//
-// Lets see what happens when we evaluate the following expression:
-//
-// `if true then else`
-// == `(\x.x \x.y.x) then else`
-// == `(\x.y.x then) else`
-// == `(\y.then else)`
-// == `then`
-//
-// Wow, our entire expression got evaluated down to `then`. You can yourself
-// try it with `false`, and see that it gets cooked down to `else`.
-//
-// Let us now take the `pair` example from above, and try to evaluate it with
-// two arguments:
-//
-// `pair = \x.y.f.f x y`
-// `pair 12 13` == `\f.f 12 13`.
-//
-// We can define `fst` and `snd` functions to extract these two items in our pair:
-//
-// `fst = \p.p true`
-// `snd = \p.p false`
-//
-// Lets try them on our pair:
-//
-// `(fst (pair 12 13))`
-// == `((\p.p true) (\f.f 12 13))`
-// == `(\f.f 12 13) true`
-// == `true 12 13`
-// == `12`
-//
-// `(snd (pair 12 13))`
-// == `((\p.p false) (\f.f 12 13))`
-// == `(\f.f 12 13) false`
-// == `false 12 13`
-// == `13`
-
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
@@ -291,6 +210,7 @@ const Token = union(enum) {
     cparen,
     separator,
     space,
+    comment,
     end,
     illegal,
 
@@ -302,9 +222,14 @@ const Token = union(enum) {
             ')' => .cparen,
             '.' => .separator,
             ' ', '\n', '\r', '\t' => .space,
+            ';' => .comment,
             0 => .end,
             else => .{ .ident = "" },
         };
+    }
+
+    fn kindEql(a: Token, b: Token) bool {
+        return std.mem.eql(u8, @tagName(a), @tagName(b));
     }
 };
 
@@ -328,7 +253,7 @@ const Lexer = struct {
         return b;
     }
 
-    fn peekedByte(self: *Lexer) ?u8 {
+    fn peekByte(self: *Lexer) ?u8 {
         const cur = self.cur;
         const b = self.byteAndAdvance();
         self.cur = cur;
@@ -340,7 +265,7 @@ const Lexer = struct {
         var b = self.byteAndAdvance() orelse return .end;
         const tok = Token.match(b);
         switch (tok) {
-            .eq, .lambda, .oparen, .cparen, .separator, .end, .illegal => return tok,
+            .eq, .lambda, .oparen, .cparen, .separator, .comment, .end, .illegal => return tok,
             // FIXME: Don't do recursion, chop instead whitespace.
             .space => return self.next(),
             .ident => {
@@ -358,7 +283,7 @@ const Lexer = struct {
                     return .{ .ident = self.content[start .. self.cur - 1] };
                 } else {
                     while (true) {
-                        b = self.peekedByte() orelse break;
+                        b = self.peekByte() orelse break;
                         if (Token.match(b) != .ident) break;
                         _ = self.byteAndAdvance();
                     }
@@ -367,47 +292,146 @@ const Lexer = struct {
             },
         }
     }
+
+    fn peek(self: *Lexer) Token {
+        const cur = self.cur;
+        const tok = self.next();
+        self.cur = cur;
+        return tok;
+    }
+
+    // Does not check the inside of `ident`. Simply expecting the kind.
+    fn expect(self: *Lexer, expected: Token) ?void {
+        if (!self.peek().kindEql(expected)) return null;
+    }
+
+    fn consume(self: *Lexer) void {
+        _ = self.next();
+    }
 };
 
-fn nextExpression(gpa: Allocator, gc: *Ast.GC, l: *Lexer) Allocator.Error!?Ast.Node.Ref {
-    switch (l.next()) {
-        .ident => |i| return try gc.make(gpa, .{ .variable = i }),
-        .lambda => {
-            const arg = arg: {
-                const ret = l.next();
-                break :arg switch (ret) {
-                    .ident => |i| i,
-                    .eq, .lambda, .oparen, .cparen, .separator, .space, .end, .illegal => {
-                        std.log.err("expected `ident`, found `{}`", .{ret});
-                        return null;
-                    },
-                };
-            };
+fn parseFunction(gpa: Allocator, gc: *Ast.GC, l: *Lexer) Allocator.Error!?Ast.Node.Ref {
+    l.expect(.{ .ident = "" }) orelse {
+        std.log.err("unexpected token. expected identifier, found: '{s}'\n", .{@tagName(l.next())});
+        return null;
+    };
+    const arg = l.next().ident;
 
-            const next = l.next();
-            if (next != .separator) {
-                std.log.err("expected separator, found `{}`", .{next});
-                return null;
-            }
+    l.expect(.separator) orelse {
+        std.log.err("unexpected token. expected separator, found: '{s}'\n", .{@tagName(l.next())});
+        return null;
+    };
+    l.consume();
 
-            const body = try nextExpression(gpa, gc, l) orelse return null;
-            return try gc.make(gpa, Ast.Node{ .function = .{ .arg = arg, .body = body } });
-        },
+    const state = l.*;
+    var a = l.next();
+    var b = l.peek();
+    l.* = state;
+
+    var body: Ast.Node.Ref = undefined;
+    if (a.kindEql(.{ .ident = "" }) and b.kindEql(.separator)) {
+        body = try parseFunction(gpa, gc, l) orelse return null;
+    } else {
+        body = try parseExpression(gpa, gc, l) orelse return null;
+    }
+
+    return try gc.make(gpa, .{ .function = .{ .arg = arg, .body = body } });
+}
+
+fn parseIdentifier(gpa: Allocator, gc: *Ast.GC, l: *Lexer, i: []const u8) Allocator.Error!?Ast.Node.Ref {
+    // We have a couple of cases.
+    // 1. i...) or ; or eof  ; return variable
+    // 2. i variable ; return application of i and var
+    // 3. i (lambda) ; return application of i and function
+    for (0..safety_bound) |_| {
+        if (l.peek() == .space) {
+            l.consume();
+            continue;
+        }
+        break;
+    } else @panic("loop safety counter exceeded");
+
+    var ret = try gc.make(gpa, .{ .variable = i });
+
+    // We have to iterate as to encapsulate with left-priority all arguments to
+    // a function application.
+    // ex: f x y z == ((f x) y) z
+    for (0..safety_bound) |_| {
+        const peeked = l.peek();
+
+        // case 1
+        if (peeked == .cparen or peeked == .comment or peeked == .end) {
+            return ret;
+        }
+
+        // case 2.
+        if (peeked.kindEql(.{ .ident = "" })) {
+            const variable = l.next().ident;
+            const variable_ref = try gc.make(gpa, .{ .variable = variable });
+            ret = try gc.make(gpa, .{ .app = .{ .lhs = ret, .rhs = variable_ref } });
+            continue;
+        }
+
+        // case 3.
+        if (peeked.kindEql(.lambda) or peeked.kindEql(.oparen)) {
+            l.consume(); // lambda symbol
+            const func = try parseFunction(gpa, gc, l) orelse return null;
+            ret = try gc.make(gpa, .{ .app = .{ .lhs = ret, .rhs = func } });
+            continue;
+        }
+
+        break;
+    } else @panic("loop safety counter exceeded");
+
+    return ret;
+}
+
+fn parseExpression(gpa: Allocator, gc: *Ast.GC, l: *Lexer) Allocator.Error!?Ast.Node.Ref {
+    const next = l.next();
+    switch (next) {
+        .ident => |i| return try parseIdentifier(gpa, gc, l, i),
+        .lambda => return parseFunction(gpa, gc, l),
         .oparen => {
-            const f = try nextExpression(gpa, gc, l) orelse return null;
+            // Inner gets allocated via gc elsewhere, therefore no need to call
+            // `make`.
+            const inner = try parseExpression(gpa, gc, l) orelse return null;
 
-            const arg = try nextExpression(gpa, gc, l) orelse return null;
+            for (0..safety_bound) |_| {
+                if (l.peek() == .space) {
+                    l.consume();
+                    continue;
+                }
+                break;
+            } else @panic("loop safety counter exceeded");
 
-            const end = l.byteAndAdvance();
-            if (end == null or Token.match(end.?) != .cparen) {
-                const c = end orelse 0;
-                std.log.err("expected ')' to close application, found `{c}`", .{c});
-                return null;
+            // Either we have something else inside this paren, or we don't
+            // 1. (inner)     ; unnessecary wrapping of variable/application, return inner
+            // 2. (inner rhs) ; return application
+            // 3. (inner) rhs ; inner is a function => return application rhs
+
+            if (l.peek() == .cparen) {
+                if (gc.get(inner).?.* == .function) {
+                    // case 3.
+                    l.consume(); // cparen
+                    // If there is no rhs, then we are equivalent to case 1,
+                    // therefore return inner.
+                    const rhs = try parseExpression(gpa, gc, l) orelse return inner;
+                    return try gc.make(gpa, .{ .app = .{ .lhs = inner, .rhs = rhs } });
+                }
+
+                // case 1.
+                l.consume(); // cparen
+                return inner;
             }
 
-            return try gc.make(gpa, Ast.Node{ .app = .{ .lhs = f, .rhs = arg } });
+            // case 2.
+            const rhs = try parseExpression(gpa, gc, l) orelse return null;
+            return try gc.make(gpa, .{ .app = .{ .lhs = inner, .rhs = rhs } });
         },
-        .eq, .cparen, .separator, .space, .end, .illegal => return null,
+        .eq, .cparen, .separator, .space, .comment, .end, .illegal => {
+            std.log.err("unexpected token. expected a primary token, found: '{s}'\n", .{@tagName(next)});
+            return null;
+        },
     }
 }
 
@@ -416,7 +440,7 @@ const Parsed = struct { Ast, usize };
 fn parse(gpa: Allocator, input: []const u8) Allocator.Error!?Parsed {
     var gc = Ast.GC{};
     var l = Lexer.init(input);
-    const root = try nextExpression(gpa, &gc, &l) orelse return null;
+    const root = try parseExpression(gpa, &gc, &l) orelse return null;
     return .{ Ast{ .root_ref = root, .gc = gc }, l.cur };
 }
 
@@ -446,79 +470,6 @@ pub fn main() !void {
 
         std.debug.print("{f}\n", .{try res.printable(alloc, &ast.gc)});
     }
-}
-
-test "parse expression and deinit" {
-    var debug = std.heap.DebugAllocator(.{}).init;
-    defer _ = debug.deinit();
-    const gpa = debug.allocator();
-
-    const expect = struct {
-        fn expect(alloc: Allocator, input: []const u8, expected: Ast) !void {
-            var writer_buf: [8192]u8 = undefined;
-            var w = std.Io.Writer.fixed(&writer_buf);
-
-            var ast, _ = try parse(alloc, input) orelse return error.Unexpected;
-            defer ast.deinit(alloc);
-
-            try w.print("{f}", .{ast});
-            const got_end = w.end;
-            const got = writer_buf[0..got_end];
-
-            try w.print("{f}", .{expected});
-            const exp = writer_buf[got_end..w.end];
-            try std.testing.expectEqualStrings(exp, got);
-        }
-    }.expect;
-
-    var ast = Ast{};
-    errdefer ast.deinit(gpa);
-
-    ast.root_ref = try ast.gc.make(gpa, .{ .variable = "var" });
-    try expect(gpa, "   var     ", ast);
-    ast.clear(gpa);
-
-    var input: []const u8 =
-        \\ \x.function_body
-    ;
-    _ = try ast.gc.make(gpa, .{ .variable = "function_body" });
-    ast.root_ref = try ast.gc.make(gpa, .{ .function = .{ .arg = "x", .body = 0 } });
-    try expect(gpa, input, ast);
-    ast.clear(gpa);
-
-    input =
-        \\ (\function_arg.function_body apped)
-    ;
-    _ = try ast.gc.make(gpa, .{ .variable = "function_body" });
-    _ = try ast.gc.make(gpa, .{ .function = .{ .arg = "function_arg", .body = 0 } });
-    _ = try ast.gc.make(gpa, .{ .variable = "apped" });
-    ast.root_ref = try ast.gc.make(gpa, .{ .app = .{ .lhs = 1, .rhs = 2 } });
-    try expect(gpa, input, ast);
-    ast.clear(gpa);
-
-    input =
-        \\ \x.some_return \wow.\some.more
-    ;
-    _ = try ast.gc.make(gpa, .{ .variable = "some_return" });
-    _ = try ast.gc.make(gpa, .{ .function = .{ .arg = "x", .body = 0 }});
-    _ = try ast.gc.make(gpa, .{ .variable = "more" });
-    _ = try ast.gc.make(gpa, .{ .function = .{ .arg = "some", .body = 2 }});
-    _ = try ast.gc.make(gpa, .{ .function = .{ .arg = "wow", .body = 3 }});
-    ast.root_ref = 1;
-    try expect(gpa, input, ast);
-    ast.root_ref = 4;
-    try expect(gpa, input[15..], ast);
-    ast.clear(gpa);
-
-    input =
-        \\ (\x.(x x) \x.(x x))
-    ;
-    const x = try ast.gc.make(gpa, .{ .variable = "x" });
-    const x_x = try ast.gc.make(gpa, .{ .app = .{ .lhs = x, .rhs = x }});
-    const rec = try ast.gc.make(gpa, .{ .function = .{ .arg = "x", .body = x_x }});
-    ast.root_ref = try ast.gc.make(gpa, .{ .app = .{ .lhs = rec, .rhs = rec }});
-    try expect(gpa, input, ast);
-    ast.clear(gpa);
 }
 
 test "lexer" {
@@ -557,6 +508,128 @@ test "lexer" {
     try exp(.cparen, l.next());
 
     try exp(Token.end, l.next());
+}
+
+test "parse" {
+    var debug = std.heap.DebugAllocator(.{}).init;
+    defer _ = debug.deinit();
+    const gpa = debug.allocator();
+
+    const expect = struct {
+        fn expect(alloc: Allocator, input: []const u8, expected: Ast) !void {
+            var writer_buf: [8192]u8 = undefined;
+            var w = std.Io.Writer.fixed(&writer_buf);
+
+            var ast, _ = try parse(alloc, input) orelse return error.Unexpected;
+            defer ast.deinit(alloc);
+
+            try w.print("{f}", .{ast});
+            const got_end = w.end;
+            const got = writer_buf[0..got_end];
+
+            try w.print("{f}", .{expected});
+            const exp = writer_buf[got_end..w.end];
+            try std.testing.expectEqualStrings(exp, got);
+        }
+    }.expect;
+
+    var ast = Ast{};
+    errdefer ast.deinit(gpa);
+
+    ast.root_ref = try ast.gc.make(gpa, .{ .variable = "var" });
+    try expect(gpa, "   var     ", ast);
+    ast.clear(gpa);
+
+    var input: []const u8 =
+        \\\x.function_body
+    ;
+    _ = try ast.gc.make(gpa, .{ .variable = "function_body" });
+    ast.root_ref = try ast.gc.make(gpa, .{ .function = .{ .arg = "x", .body = 0 } });
+    try expect(gpa, input, ast);
+    ast.clear(gpa);
+
+    input =
+        \\ (\function_arg.function_body) apped
+    ;
+    _ = try ast.gc.make(gpa, .{ .variable = "function_body" });
+    _ = try ast.gc.make(gpa, .{ .function = .{ .arg = "function_arg", .body = 0 } });
+    _ = try ast.gc.make(gpa, .{ .variable = "apped" });
+    ast.root_ref = try ast.gc.make(gpa, .{ .app = .{ .lhs = 1, .rhs = 2 } });
+    try expect(gpa, input, ast);
+    ast.clear(gpa);
+
+    input =
+        \\ function app_this
+    ;
+    _ = try ast.gc.make(gpa, .{ .variable = "function" });
+    _ = try ast.gc.make(gpa, .{ .variable = "app_this" });
+    ast.root_ref = try ast.gc.make(gpa, .{ .app = .{ .lhs = 0, .rhs = 1 } });
+    try expect(gpa, input, ast);
+    ast.clear(gpa);
+
+    input =
+        \\ function ; app_this
+    ;
+    ast.root_ref = try ast.gc.make(gpa, .{ .variable = "function" });
+    try expect(gpa, input, ast);
+    ast.clear(gpa);
+
+    input =
+        \\ (function app_this)
+    ;
+    _ = try ast.gc.make(gpa, .{ .variable = "function" });
+    _ = try ast.gc.make(gpa, .{ .variable = "app_this" });
+    ast.root_ref = try ast.gc.make(gpa, .{ .app = .{ .lhs = 0, .rhs = 1 } });
+    try expect(gpa, input, ast);
+    ast.clear(gpa);
+
+    input =
+        \\ ((((  var)  )))
+    ;
+    ast.root_ref = try ast.gc.make(gpa, .{ .variable = "var" });
+    try expect(gpa, input, ast);
+    ast.clear(gpa);
+
+    input =
+        \\ \x.\y.\f.f x y
+    ;
+    {
+        const x = try ast.gc.make(gpa, .{ .variable = "x" });
+        const y = try ast.gc.make(gpa, .{ .variable = "y" });
+        const f = try ast.gc.make(gpa, .{ .variable = "f" });
+        const fx = try ast.gc.make(gpa, .{ .app = .{ .lhs = f, .rhs = x } });
+        const fxy = try ast.gc.make(gpa, .{ .app = .{ .lhs = fx, .rhs = y } });
+        const ffxy = try ast.gc.make(gpa, .{ .function = .{ .arg = "f", .body = fxy } });
+        const yffxy = try ast.gc.make(gpa, .{ .function = .{ .arg = "y", .body = ffxy } });
+        ast.root_ref = try ast.gc.make(gpa, .{ .function = .{ .arg = "x", .body = yffxy } });
+        try expect(gpa, input, ast);
+        ast.clear(gpa);
+    }
+
+    input =
+        \\ \x.some_return \wow.some.more
+    ;
+    _ = try ast.gc.make(gpa, .{ .variable = "some_return" });
+    _ = try ast.gc.make(gpa, .{ .variable = "more" });
+    _ = try ast.gc.make(gpa, .{ .function = .{ .arg = "some", .body = 1 } });
+    _ = try ast.gc.make(gpa, .{ .function = .{ .arg = "wow", .body = 2 } });
+    _ = try ast.gc.make(gpa, .{ .app = .{ .lhs = 0, .rhs = 3 } });
+    _ = try ast.gc.make(gpa, .{ .function = .{ .arg = "x", .body = 4 } });
+    ast.root_ref = 5;
+    try expect(gpa, input, ast);
+    ast.root_ref = 3;
+    try expect(gpa, input[15..], ast);
+    ast.clear(gpa);
+
+    input =
+        \\ (\x.(x x)) (\x.(x x))
+    ;
+    const x = try ast.gc.make(gpa, .{ .variable = "x" });
+    const x_x = try ast.gc.make(gpa, .{ .app = .{ .lhs = x, .rhs = x } });
+    const rec = try ast.gc.make(gpa, .{ .function = .{ .arg = "x", .body = x_x } });
+    ast.root_ref = try ast.gc.make(gpa, .{ .app = .{ .lhs = rec, .rhs = rec } });
+    try expect(gpa, input, ast);
+    ast.clear(gpa);
 }
 
 test "eval" {
@@ -599,22 +672,36 @@ test "eval" {
         \\ \x.x          
     ;
     _ = try ast.gc.make(gpa, .{ .variable = "x" });
-    ast.root_ref = try ast.gc.make(gpa, .{ .function = .{ .arg = "x", .body = 0 }});
+    ast.root_ref = try ast.gc.make(gpa, .{ .function = .{ .arg = "x", .body = 0 } });
     try expect(gpa, input, ast);
     ast.clear(gpa);
 
     input =
-        \\ (\x.x y)
+        \\ (\x.x) y
     ;
     ast.root_ref = try ast.gc.make(gpa, .{ .variable = "y" });
     try expect(gpa, input, ast);
     ast.clear(gpa);
 
     input =
-        \\ (\x.\f.x y)
+        \\ (\x.f.x) y
     ;
     _ = try ast.gc.make(gpa, .{ .variable = "y" });
-    ast.root_ref = try ast.gc.make(gpa, .{ .function = .{ .arg = "f", .body = 0 }});
+    ast.root_ref = try ast.gc.make(gpa, .{ .function = .{ .arg = "f", .body = 0 } });
+    try expect(gpa, input, ast);
+    ast.clear(gpa);
+
+    input =
+        \\ \x.y.f.f x y
+    ;
+    const x = try ast.gc.make(gpa, .{ .variable = "x" });
+    const y = try ast.gc.make(gpa, .{ .variable = "y" });
+    const f = try ast.gc.make(gpa, .{ .variable = "f" });
+    const fx = try ast.gc.make(gpa, .{ .app = .{ .lhs = f, .rhs = x } });
+    const fxy = try ast.gc.make(gpa, .{ .app = .{ .lhs = fx, .rhs = y } });
+    const ffxy = try ast.gc.make(gpa, .{ .function = .{ .arg = "f", .body = fxy } });
+    const yffxy = try ast.gc.make(gpa, .{ .function = .{ .arg = "y", .body = ffxy } });
+    ast.root_ref = try ast.gc.make(gpa, .{ .function = .{ .arg = "x", .body = yffxy } });
     try expect(gpa, input, ast);
     ast.clear(gpa);
 }

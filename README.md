@@ -18,9 +18,9 @@ anything
 ```
 
 A *function* takes the form: `\x.y` where the `x` variable is the function's
-argument, and `y` is the returned expression. Note that `y` doesn't have to
-be a variable, which enables important functional concepts, such as
-currying. Example:
+argument, and `y` is the returned expression. Note that `y` doesn't have to be
+a variable, which enables important functional concepts, such as currying.
+Examples:
 
 ```
 \x.x         ; x -> x (the id function)
@@ -29,20 +29,21 @@ currying. Example:
 \x.y.f.f x y ; When applied to two arguments, it creates a pair.
 ```
 
-An *application* of a function takes the form: `(f x)` where `f` is the
-function to apply the argument `x` to. Applications are usually
-syntactically similar to S-expressions, with the notable exceptions of being
-inside function returns, such as in the Pair example above, where `f x y` in
-the function return is an application of `f` with the arguments `x` and `y`.
-Example
-
+An *application* of a function takes the form: `f x` where `f` is the function
+to apply the argument `x` to. If `f` is *named*, then no parentheses are
+needed. If however `f` is a lambda, then parantheses are needed to know which
+applications are ended where. Examples:
 ```
-(f x)   ; f(x)
-(g x y) ; g(x, y). Note that `g` has to be defined as a curried function, i.e `g = \x.y.z`, thus making `(g x)` equal to `\y.z`.
+f x      ; f(x)
+g x y    ; g(x, y). Note that `g` has to be defined as a curried function, i.e `g = \x.y.z`, thus making `(g x)` equal to `\y.z`.
+(\x.x) y ; Lambdas are wrapped in parentheses during application.
 ```
 
-*Comments* are denoted via `;`. The parser ignores everything from `;` until
-a newline.
+When chaining multiple function applications, such as `fst (pair 12 13)`, then
+parentheses are needed to denote precedence, as `fst pair 12 13` is ambiguous.
+
+*Comments* are denoted via `;`. The parser ignores everything from `;` until a
+newline.
 
 ## Examples
 
@@ -65,10 +66,10 @@ if = \x.x ; (i.e the id function)
 Lets see what happens when we evaluate the following expression:
 
 ```
-if true then else       ; ==
-(\x.x \x.y.x) then else ; ==
-(\x.y.x then) else      ; ==
-(\y.then else)          ; ==
+if true then else         ; ==
+((\x.x) \x.y.x) then else ; ==
+(\x.y.x) then else        ; ==
+(\y.then) else            ; ==
 then
 ```
 
@@ -83,7 +84,7 @@ two arguments:
 ```
 ; Remember the definition of pair
 pair = \x.y.f.f x y
-pair 12 13 ; == \f.f 12 13
+pair 12 13 ; == (\f.f) 12 13
 ```
 
 We can define `fst` and `snd` functions to extract these two items in our
@@ -97,15 +98,15 @@ snd = \p.p false
 Lets try them on our pair:
 
 ```
-(fst (pair 12 13))         ; ==
-((\p.p true) (\f.f 12 13)) ; ==
-(\f.f 12 13) true          ; ==
-true 12 13                 ; ==
+fst (pair 12 13)          ; ==
+(\p.p true) (\f.f 12 13)  ; ==
+(\f.f 12 13) true         ; ==
+true 12 13                ; ==
 12
 
-(snd (pair 12 13))          ; ==
-((\p.p false) (\f.f 12 13)) ; ==
-(\f.f 12 13) false          ; ==
-false 12 13                 ; ==
+snd (pair 12 13)          ; ==
+(\p.p false) (\f.f 12 13) ; ==
+(\f.f 12 13) false        ; ==
+false 12 13               ; ==
 13
 ```
