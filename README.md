@@ -2,6 +2,29 @@
 
 > Single file REPL for a Lambda Calculus interpreter.
 
+## Build
+
+This project is written in [Zig](https://ziglang.org/), therefore to build this
+project you need the Zig compiler installed.
+
+To build the project, simply run
+
+```console
+zig build-exe lambda.zig
+```
+
+which will output an executable called `lambda`.
+
+A `build.zig` file comes bundled with this package, but is not needed for
+building. The build file is primarily used for testing purposes, but if used
+for building run
+
+```console
+zig build
+```
+
+which will put the executable in `zig-out/bin/lambda`.
+
 ## Syntax:
 
 A *variable* is some sequence of characters. For example: `\x.y` denotes a

@@ -1,3 +1,4 @@
 .direnv/
 lambda
+zig-out/
 .zig-cache/
