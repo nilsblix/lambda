@@ -1,8 +1,89 @@
+// Single file REPL for a Lambda Calculus interpreter.
+//
+// ### Syntax:
+//
+// A *variable* is some sequence of characters. For example: `\x.y` denotes a
+// function where the argument is a variable `x` and returns a variable `y`.
+// Variables can be any length, and can overload semantic tokens by wrapping
+// the variable name in @"...". Examples:
+//
+// `x`, `var`, `anything`, `@"some variable"`, `@"\wow.\is this a variable?"`.
+//
+// A *function* takes the form: `\x.y` where the `x` variable is the function's
+// argument, and `y` is the returned expression. Note that `y` doesn't have to
+// be a variable, which enables important functional concepts, such as
+// currying. Examples:
+//
+// `\x.x`         - x -> x (the id function)
+// `\x.y`         - x -> y
+// `\x.y.z`       - x, y -> z
+// `\x.y.f.f x y` - When applied to two arguments, it creates a pair.
+//
+// An *application* of a function takes the form: `(f x)` where `f` is the
+// function to apply the argument `x` to. Applications are usually
+// syntactically similar to S-expressions, with the notable exceptions of being
+// inside function returns, such as in the Pair example above, where `f x y` in
+// the function return is an application of `f` with the arguments `x` and `y`.
+// Examples:
+//
+// `(f x)`   - f(x)
+// `(g x y)` - g(x, y). Note that `g` has to be defined as a curried function,
+// i.e `g = \x.y.z`, thus making `(g x)` equal to `\y.z`.
+//
+//
+// ### Examples
+//
+// With this system, we can define simple types, such as booleans:
+//
+// `true = \x.y.x`
+// `false = \x.y.y`.
+//
+// But, why does these two functions behave as booleans? Lets try to use them
+// in some if/else statement. But first lets introduce an `if` function.
+//
+// `if = \x.x` (i.e the id function)
+//
+// Lets see what happens when we evaluate the following expression:
+//
+// `if true then else`
+// == `(\x.x \x.y.x) then else`
+// == `(\x.y.x then) else`
+// == `(\y.then else)`
+// == `then`
+//
+// Wow, our entire expression got evaluated down to `then`. You can yourself
+// try it with `false`, and see that it gets cooked down to `else`.
+//
+// Let us now take the `pair` example from above, and try to evaluate it with
+// two arguments:
+//
+// `pair = \x.y.f.f x y`
+// `pair 12 13` == `\f.f 12 13`.
+//
+// We can define `fst` and `snd` functions to extract these two items in our pair:
+//
+// `fst = \p.p true`
+// `snd = \p.p false`
+//
+// Lets try them on our pair:
+//
+// `(fst (pair 12 13))`
+// == `((\p.p true) (\f.f 12 13))`
+// == `(\f.f 12 13) true`
+// == `true 12 13`
+// == `12`
+//
+// `(snd (pair 12 13))`
+// == `((\p.p false) (\f.f 12 13))`
+// == `(\f.f 12 13) false`
+// == `false 12 13`
+// == `13`
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 
-const safety_bound: usize = 500_000;
+const safety_bound: usize = 100_000;
 
 const Ast = struct {
     root_ref: Node.Ref = 0,
@@ -91,12 +172,15 @@ const Ast = struct {
                         try w.print("['{d}' not found]", .{app.lhs});
                         return;
                     };
+                    try w.print("(", .{});
                     try lhs.format(gc, w);
+                    try w.print(" ", .{});
                     const rhs = gc.get(app.rhs) orelse {
                         try w.print("['{d}' not found]", .{app.rhs});
                         return;
                     };
                     try rhs.format(gc, w);
+                    try w.print(")", .{});
                 },
             }
         }
@@ -162,9 +246,7 @@ const Ast = struct {
 
         const EvalError = error{ExpectedFunction} || Allocator.Error;
 
-        fn eval(self: *const Node, gpa: Allocator, gc: *GC, level: usize) EvalError!Ref {
-            if (level > safety_bound) @panic("loop safety counter exceeded");
-
+        fn eval(self: *const Node, gpa: Allocator, gc: *GC) EvalError!Ref {
             switch (self.*) {
                 // Snapshot before append: gc.make can grow and relocate storage.
                 .variable, .function => {
@@ -172,20 +254,17 @@ const Ast = struct {
                     return try gc.make(gpa, node);
                 },
                 .app => |app| {
-                    const f = f: {
-                        // We know that all nodes get created via gc.make,
-                        // therefore invalid state doesn't exist.
-                        const lhs = (gc.get(app.lhs) orelse unreachable).*;
-                        const ret_ref = try lhs.eval(gpa, gc, level + 1);
-                        const ret = gc.get(ret_ref) orelse unreachable;
-                        if (ret.* != .function) return error.ExpectedFunction;
-                        break :f ret.*.function;
-                    };
+                    // We know that all nodes get created via gc.make,
+                    // therefore invalid state doesn't exist.
+                    const lhs = (gc.get(app.lhs) orelse unreachable).*;
+                    const function_ref = try lhs.eval(gpa, gc);
 
                     const rhs = (gc.get(app.rhs) orelse unreachable).*;
-                    const replacement_ref = try rhs.eval(gpa, gc, level + 1);
+                    const replacement_ref = try rhs.eval(gpa, gc);
 
-                    return try replace(gpa, gc, f.arg, f.body, replacement_ref);
+                    const f = gc.get(function_ref) orelse unreachable;
+                    if (f.* != .function) return error.ExpectedFunction;
+                    return try replace(gpa, gc, f.function.arg, f.function.body, replacement_ref);
                 },
             }
         }
@@ -193,9 +272,14 @@ const Ast = struct {
 
     fn eval(self: *Ast, gpa: Allocator) Node.EvalError!?Node {
         const r = self.gc.get(self.root_ref) orelse return null;
-        const ref = try r.eval(gpa, &self.gc, 0);
-        const ptr = self.gc.get(ref) orelse return null;
-        return ptr.*;
+        var ref = try r.eval(gpa, &self.gc);
+
+        for (0..safety_bound) |_| {
+            const ptr = self.gc.get(ref) orelse return null;
+            if (ptr.* != .app) return ptr.*;
+            const next = ptr.*;
+            ref = try next.eval(gpa, &self.gc);
+        } else @panic("loop safety counter exceeded");
     }
 };
 
@@ -341,37 +425,27 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    const input =
-        \\ (\x.(x x) \x.(x x))
-    ;
+    const f = std.fs.File.stdin();
+    defer f.close();
 
-    var ast, _ = try parse(alloc, input) orelse return;
-    defer ast.deinit(alloc);
+    var reader_buf: [4096]u8 = undefined;
+    var reader = f.reader(&reader_buf);
 
-    const res = try ast.eval(alloc) orelse unreachable;
-    std.debug.print("{f}\n", .{try res.printable(alloc, &ast.gc)});
+    while (true) {
+        std.debug.print("@> ", .{});
+        const input = try reader.interface.takeDelimiter('\n') orelse continue;
+        if (std.mem.eql(u8, input, ":quit")) break;
 
-    // const f = std.fs.File.stdin();
-    // defer f.close();
-    //
-    // var reader_buf: [4096]u8 = undefined;
-    // var reader = f.reader(&reader_buf);
-    //
-    // while (true) {
-    //     std.debug.print("@> ", .{});
-    //     const input = try reader.interface.takeDelimiter('\n') orelse continue;
-    //     if (std.mem.eql(u8, input, ":quit")) break;
-    //
-    //     var ast, _ = try parse(alloc, input) orelse continue;
-    //     defer ast.deinit(alloc);
-    //
-    //     const res = try ast.eval(alloc) orelse {
-    //         std.debug.print("info: did not evaluate to a proper result\n", .{});
-    //         continue;
-    //     };
-    //
-    //     std.debug.print("{f}\n", .{try res.printable(alloc, &ast.gc)});
-    // }
+        var ast, _ = try parse(alloc, input) orelse continue;
+        defer ast.deinit(alloc);
+
+        const res = try ast.eval(alloc) orelse {
+            std.debug.print("info: did not evaluate to a proper result\n", .{});
+            continue;
+        };
+
+        std.debug.print("{f}\n", .{try res.printable(alloc, &ast.gc)});
+    }
 }
 
 test "parse expression and deinit" {
