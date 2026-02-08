@@ -5,8 +5,15 @@ const Writer = std.Io.Writer;
 const safety_bound: usize = 100_000;
 
 const Ast = struct {
-    root_ref: Node.Ref = 0,
-    gc: GC = .{},
+    root_ref: Node.Ref,
+    gc: GC,
+
+    fn init(gpa: Allocator) Ast {
+        return .{
+            .root_ref = 0,
+            .gc = .init(gpa),
+        };
+    }
 
     fn deinit(self: *Ast, gpa: Allocator) void {
         self.gc.deinit(gpa);
@@ -14,7 +21,7 @@ const Ast = struct {
 
     fn clear(self: *Ast, gpa: Allocator) void {
         self.deinit(gpa);
-        self.* = Ast{};
+        self.* = .init(gpa);
     }
 
     fn root(self: *const Ast) ?Node {
@@ -31,7 +38,20 @@ const Ast = struct {
     }
 
     const GC = struct {
-        buf: std.ArrayList(Node) = .empty,
+        buf: std.ArrayList(Node),
+        gens: std.StringHashMap(Node.Ref),
+
+        fn init(gpa: Allocator) GC {
+            return .{
+                .buf = .empty,
+                .gens = .init(gpa),
+            };
+        }
+
+        fn deinit(self: *GC, gpa: Allocator) void {
+            self.gens.deinit();
+            self.buf.deinit(gpa);
+        }
 
         fn get(self: *const GC, ref: Node.Ref) ?*Node {
             if (ref >= self.buf.items.len) return null;
@@ -41,10 +61,6 @@ const Ast = struct {
         fn make(self: *GC, gpa: Allocator, node: Node) Allocator.Error!Node.Ref {
             try self.buf.append(gpa, node);
             return self.buf.items.len - 1;
-        }
-
-        fn deinit(self: *GC, gpa: Allocator) void {
-            self.buf.deinit(gpa);
         }
     };
 
@@ -104,12 +120,6 @@ const Ast = struct {
             }
         }
 
-        /// `body` needs to be freed after calling this, as all heap allocated
-        /// members get duped in this function.
-        ///
-        /// All members of the returned Node are heap allocated, while the top
-        /// level Node is copied, thus on the stack.
-        ///
         /// (\param.body) arg
         fn replace(
             gpa: Allocator,
@@ -380,72 +390,52 @@ fn parseExpression(gpa: Allocator, gc: *Ast.GC, l: *Lexer) Allocator.Error!?Ast.
     } else @panic("loop safety counter exceeded");
 }
 
-const Parsed = struct { Ast, usize };
+const Parsed = union(enum) {
+    assignment: struct { []const u8, Ast, usize },
+    expression: struct { Ast, usize },
+};
 
 fn skipLeadingTrivia(l: *Lexer) void {
-    while (true) {
+    for (0..safety_bound) |_| {
         switch (l.peek()) {
             .space, .newline => l.consume(),
             .comment => l.consume(),
             .eq, .lambda, .oparen, .cparen, .separator, .end, .illegal, .ident => return,
         }
-    }
+    } else @panic("loop safety counter exceeded");
 }
 
 fn parse(gpa: Allocator, input: []const u8) Allocator.Error!?Parsed {
-    var gc = Ast.GC{};
+    var gc = Ast.GC.init(gpa);
+    errdefer gc.deinit(gpa);
+
     var l = Lexer.init(input);
     skipLeadingTrivia(&l);
+
+    var copy = l;
+    const a = copy.next();
+    const b = copy.next();
+    if (a.kindEql(.{ .ident = "" }) and b.kindEql(.eq)) {
+        const as = try parseExpression(gpa, &gc, &copy) orelse return null;
+        const ast = Ast{ .root_ref = as, .gc = gc };
+
+        const gop = try gc.gens.getOrPut(a.ident);
+        if (gop.found_existing) {
+            std.log.err("assignment already exists, found: {s}\n", .{a.ident});
+            return null;
+        }
+
+        gop.value_ptr.* = ast.root_ref;
+
+        return Parsed{ .assignment = .{ a.ident, ast, copy.cur } };
+    }
+
     const root = try parseExpression(gpa, &gc, &l) orelse return null;
-    return .{ Ast{ .root_ref = root, .gc = gc }, l.cur };
+    return Parsed{ .expression = .{ Ast{ .root_ref = root, .gc = gc }, l.cur } };
 }
 
-fn repl(alloc: Allocator) !void {
-    const stdin = std.fs.File.stdin();
-    defer stdin.close();
-
-    var stdin_buf: [4096]u8 = undefined;
-    var stdin_reader = stdin.reader(&stdin_buf);
-
-    while (true) {
-        std.debug.print("@> ", .{});
-        const input = try stdin_reader.interface.takeDelimiter('\n') orelse continue;
-        if (std.mem.eql(u8, input, ":quit")) break;
-
-        var ast, _ = try parse(alloc, input) orelse continue;
-        defer ast.deinit(alloc);
-
-        const res = ast.eval(alloc) catch |e| switch (e) {
-            error.ExpectedFunction => {
-                std.log.err("expected a function, found non-function", .{});
-                continue;
-            },
-            error.OutOfMemory => return e,
-        } orelse {
-            std.debug.print("info: did not evaluate to a proper result\n", .{});
-            continue;
-        };
-
-        std.debug.print("{f}\n", .{try res.printable(alloc, &ast.gc)});
-    }
-}
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
-
-    var args = std.process.args();
-    _ = args.next();
-    const file_path_opt = args.next();
-    if (file_path_opt == null or file_path_opt.?.len == 0) {
-        try repl(alloc);
-        return;
-    }
-
-    const file_path = file_path_opt.?;
-
-    var f = try std.fs.cwd().openFile(file_path, .{});
+fn execute(alloc: Allocator, path: []const u8) !void {
+    var f = try std.fs.cwd().openFile(path, .{});
     defer f.close();
 
     var file_buf: [4096]u8 = undefined;
@@ -458,7 +448,9 @@ pub fn main() !void {
     var left: []const u8 = to_run;
     while (true) {
         const prev = left;
-        var ast, const pos = try parse(alloc, left) orelse break;
+
+        const parsed = try parse(alloc, left) orelse break;
+        var ast, const pos = parsed.expression;
         defer ast.deinit(alloc);
 
         left = left[pos..];
@@ -477,6 +469,75 @@ pub fn main() !void {
         const printable = try node.printable(alloc, &ast.gc);
         std.debug.print("{f}\n", .{printable});
     }
+}
+
+fn repl(alloc: Allocator) !void {
+    const stdin = std.fs.File.stdin();
+    defer stdin.close();
+
+    var stdin_buf: [4096]u8 = undefined;
+    var stdin_reader = stdin.reader(&stdin_buf);
+
+    while (true) {
+        std.debug.print("@> ", .{});
+        const input = try stdin_reader.interface.takeDelimiter('\n') orelse continue;
+        if (std.mem.eql(u8, input, ":q")) break;
+
+        const parsed = try parse(alloc, input) orelse break;
+        var ast, _ = parsed.expression;
+        defer ast.deinit(alloc);
+
+        const res = ast.eval(alloc) catch |e| switch (e) {
+            error.ExpectedFunction => {
+                std.log.err("expected a function, found non-function", .{});
+                continue;
+            },
+            error.OutOfMemory => return e,
+        } orelse {
+            std.log.info("did not evaluate to a proper result\n", .{});
+            continue;
+        };
+
+        std.debug.print("{f}\n", .{try res.printable(alloc, &ast.gc)});
+    }
+}
+
+const usage =
+    \\Usage:
+    \\    lambda [<script>|repl]
+    \\
+    \\Commands:
+    \\    <script>                 Path to a file to execute
+    \\    repl + <optional script> Use the repl, and an optional path to execute before.
+    \\
+    \\Examples:
+    \\    $ lambda execute.lambda
+    \\    $ lambda repl
+    \\    $ lambda repl std.lambda
+;
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}).init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var args = std.process.args();
+    if (!args.skip()) return error.Bad;
+
+    const first = args.next() orelse {
+        std.log.err("you have to specify either a file to execute or repl\n\n{s}", .{usage});
+        return;
+    };
+
+    if (std.mem.eql(u8, first, "repl")) {
+        if (args.next()) |path| {
+            try execute(alloc, path);
+        }
+        try repl(alloc);
+        return;
+    }
+
+    try execute(alloc, first);
 }
 
 test "lexer" {
@@ -517,6 +578,66 @@ test "lexer" {
     try exp(Token.end, l.next());
 }
 
+test "parse assignment" {
+    var debug = std.heap.DebugAllocator(.{}).init;
+    defer _ = debug.deinit();
+    const gpa = debug.allocator();
+
+    const expect = struct {
+        fn expect(alloc: Allocator, input: []const u8, name: []const u8, expected: Ast) !void {
+            var writer_buf: [8192]u8 = undefined;
+            var w = std.Io.Writer.fixed(&writer_buf);
+
+            const parsed = try parse(alloc, input) orelse return error.Unexpected;
+            if (!std.mem.eql(u8, @tagName(parsed), "assignment")) return error.Unexpected;
+
+            const n, var ast, _ = parsed.assignment;
+            defer ast.deinit(alloc);
+
+            if (!std.mem.eql(u8, name, n)) return error.WrongName;
+
+            try w.print("{f}", .{ast});
+            const got_end = w.end;
+            const got = writer_buf[0..got_end];
+
+            try w.print("{f}", .{expected});
+            const exp = writer_buf[got_end..w.end];
+            try std.testing.expectEqualStrings(exp, got);
+        }
+    }.expect;
+
+    var ast = Ast.init(gpa);
+    errdefer ast.deinit(gpa);
+
+    ast.root_ref = try ast.gc.make(gpa, .{ .variable = "var" });
+    try expect(gpa, "some_var =   var     ", "some_var", ast);
+    ast.clear(gpa);
+
+    var input: []const u8 =
+        \\ func=\x.function_body
+    ;
+    _ = try ast.gc.make(gpa, .{ .variable = "function_body" });
+    ast.root_ref = try ast.gc.make(gpa, .{ .function = .{ .arg = "x", .body = 0 } });
+    try expect(gpa, input, "func", ast);
+    ast.clear(gpa);
+
+    input =
+        \\ pair = \x.y.f.f x y
+    ;
+    {
+        const x = try ast.gc.make(gpa, .{ .variable = "x" });
+        const y = try ast.gc.make(gpa, .{ .variable = "y" });
+        const f = try ast.gc.make(gpa, .{ .variable = "f" });
+        const fx = try ast.gc.make(gpa, .{ .app = .{ .lhs = f, .rhs = x } });
+        const fxy = try ast.gc.make(gpa, .{ .app = .{ .lhs = fx, .rhs = y } });
+        const ffxy = try ast.gc.make(gpa, .{ .function = .{ .arg = "f", .body = fxy } });
+        const yffxy = try ast.gc.make(gpa, .{ .function = .{ .arg = "y", .body = ffxy } });
+        ast.root_ref = try ast.gc.make(gpa, .{ .function = .{ .arg = "x", .body = yffxy } });
+        try expect(gpa, input, "pair", ast);
+        ast.clear(gpa);
+    }
+}
+
 test "parse" {
     var debug = std.heap.DebugAllocator(.{}).init;
     defer _ = debug.deinit();
@@ -527,7 +648,10 @@ test "parse" {
             var writer_buf: [8192]u8 = undefined;
             var w = std.Io.Writer.fixed(&writer_buf);
 
-            var ast, _ = try parse(alloc, input) orelse return error.Unexpected;
+            const parsed = try parse(alloc, input) orelse return error.Unexpected;
+            if (!std.mem.eql(u8, @tagName(parsed), "expression")) return error.Unexpected;
+
+            var ast, _ = parsed.expression;
             defer ast.deinit(alloc);
 
             try w.print("{f}", .{ast});
@@ -540,7 +664,7 @@ test "parse" {
         }
     }.expect;
 
-    var ast = Ast{};
+    var ast = Ast.init(gpa);
     errdefer ast.deinit(gpa);
 
     ast.root_ref = try ast.gc.make(gpa, .{ .variable = "var" });
@@ -598,7 +722,7 @@ test "parse" {
     ast.clear(gpa);
 
     input =
-        \\ \x.\y.\f.f x y
+        \\ \x.y.f.f x y
     ;
     {
         const x = try ast.gc.make(gpa, .{ .variable = "x" });
@@ -649,7 +773,10 @@ test "eval" {
             var writer_buf: [8192]u8 = undefined;
             var w = std.Io.Writer.fixed(&writer_buf);
 
-            var ast, _ = try parse(alloc, input) orelse return error.Unexpected;
+            const parsed = try parse(alloc, input) orelse return error.Unexpected;
+            if (!std.mem.eql(u8, @tagName(parsed), "expression")) return error.Unexpected;
+
+            var ast, _ = parsed.expression;
             defer ast.deinit(alloc);
 
             var res = try ast.eval(alloc) orelse return error.Unexpected;
@@ -665,7 +792,7 @@ test "eval" {
         }
     }.expect;
 
-    var ast = Ast{};
+    var ast = Ast.init(gpa);
     errdefer ast.deinit(gpa);
 
     var input: []const u8 =
