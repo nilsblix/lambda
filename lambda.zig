@@ -173,14 +173,20 @@ const Ast = struct {
             }
         }
 
-        const Error = error{ExpectedFunction} || Allocator.Error;
+        const Error = error{ExpectedFunction, InvalidGen} || Allocator.Error;
 
         fn evalFromRef(gpa: Allocator, gc: *GC, ref: Ref) Error!Ref {
             const node = gc.get(ref).?.*;
             switch (node) {
-                // Snapshot before append such that gc.make can grow and
-                // relocate storage.
-                .variable, .function => return try gc.make(gpa, node),
+                // All gens in gc get put in a variable, thus we have to check
+                // if this variable is a gen or not.
+                .variable => |v| {
+                    if (gc.gens.get(v)) |gen_ref| {
+                        return gen_ref;
+                    }
+                    return ref;
+                },
+                .function => return try gc.make(gpa, node),
                 .app => |app| {
                     const function_ref = try Node.evalFromRef(gpa, gc, app.lhs);
                     const replacement_ref = try evalFromRef(gpa, gc, app.rhs);
@@ -330,13 +336,13 @@ const Lexer = struct {
 
 fn parseFunction(gpa: Allocator, gc: *Ast.GC, l: *Lexer) Allocator.Error!?Ast.Node.Ref {
     l.expect(.{ .ident = "" }) orelse {
-        std.log.err("unexpected token. expected identifier, found: '{s}'\n", .{@tagName(l.next())});
+        std.log.err("unexpected token. expected identifier, found: '{s}'", .{@tagName(l.next())});
         return null;
     };
     const arg = l.next().ident;
 
     l.expect(.separator) orelse {
-        std.log.err("unexpected token. expected separator, found: '{s}'\n", .{@tagName(l.next())});
+        std.log.err("unexpected token. expected separator, found: '{s}'", .{@tagName(l.next())});
         return null;
     };
     l.consume();
@@ -364,7 +370,7 @@ fn parsePrimary(gpa: Allocator, gc: *Ast.GC, l: *Lexer) Allocator.Error!?Ast.Nod
         .oparen => {
             const inner = try parseExpression(gpa, gc, l) orelse return null;
             if (l.peek() != .cparen) {
-                std.log.err("unexpected token. expected ')', found: '{s}'\n", .{@tagName(l.next())});
+                std.log.err("unexpected token. expected ')', found: '{s}'", .{@tagName(l.next())});
                 return null;
             }
             l.consume();
@@ -372,7 +378,7 @@ fn parsePrimary(gpa: Allocator, gc: *Ast.GC, l: *Lexer) Allocator.Error!?Ast.Nod
         },
         .cparen, .space, .newline, .comment, .end => return null,
         .eq, .separator, .illegal => {
-            std.log.err("unexpected token. expected a primary token, found: '{s}'\n", .{@tagName(next)});
+            std.log.err("unexpected token. expected a primary token, found: '{s}'", .{@tagName(next)});
             return null;
         },
     }
@@ -412,29 +418,45 @@ fn parse(gpa: Allocator, input: []const u8) Allocator.Error!?Parsed {
     var l = Lexer.init(input);
     skipLeadingTrivia(&l);
 
-    var copy = l;
-    const a = copy.next();
-    const b = copy.next();
-    if (a.kindEql(.{ .ident = "" }) and b.kindEql(.eq)) {
-        const as = try parseExpression(gpa, &gc, &copy) orelse return null;
-        const ast = Ast{ .root_ref = as, .gc = gc };
-
-        const gop = try gc.gens.getOrPut(a.ident);
-        if (gop.found_existing) {
-            std.log.err("assignment already exists, found: {s}\n", .{a.ident});
-            return null;
-        }
-
-        gop.value_ptr.* = ast.root_ref;
-
-        return Parsed{ .assignment = .{ a.ident, ast, copy.cur } };
-    }
-
     const root = try parseExpression(gpa, &gc, &l) orelse return null;
     return Parsed{ .expression = .{ Ast{ .root_ref = root, .gc = gc }, l.cur } };
 }
 
-fn execute(alloc: Allocator, path: []const u8) !void {
+const ParsedMutable = union(enum) {
+    assignment: struct { []const u8, Ast.Node.Ref, usize },
+    expression: struct { Ast.Node.Ref, usize },
+};
+
+fn parseMutable(
+    gpa: Allocator,
+    gc: *Ast.GC,
+    input: []const u8
+) Allocator.Error!?ParsedMutable {
+    var l = Lexer.init(input);
+    skipLeadingTrivia(&l);
+
+    var copy = l;
+    const a = copy.next();
+    const b = copy.next();
+    if (a.kindEql(.{ .ident = "" }) and b.kindEql(.eq)) {
+        const as = try parseExpression(gpa, gc, &copy) orelse return null;
+
+        const gop = try gc.gens.getOrPut(a.ident);
+        if (gop.found_existing) {
+            std.log.err("assignment already exists, found: {s}", .{a.ident});
+            return null;
+        }
+
+        gop.value_ptr.* = as;
+
+        return ParsedMutable{ .assignment = .{ a.ident, as, copy.cur } };
+    }
+
+    const root = try parseExpression(gpa, gc, &l) orelse return null;
+    return ParsedMutable{ .expression = .{ root, copy.cur } };
+}
+
+fn executeMutable(gpa: Allocator, gc: *Ast.GC, path: []const u8) !void {
     var f = try std.fs.cwd().openFile(path, .{});
     defer f.close();
 
@@ -442,22 +464,28 @@ fn execute(alloc: Allocator, path: []const u8) !void {
     var file_reader = f.reader(&file_buf);
 
     const size = try file_reader.getSize();
-    const to_run = try file_reader.interface.readAlloc(alloc, size);
-    defer alloc.free(to_run);
+    const to_run = try file_reader.interface.readAlloc(gpa, size);
+    defer gpa.free(to_run);
 
     var left: []const u8 = to_run;
     while (true) {
         const prev = left;
 
-        const parsed = try parse(alloc, left) orelse break;
-        var ast, const pos = parsed.expression;
-        defer ast.deinit(alloc);
+        const parsed_mut = try parseMutable(gpa, gc, left) orelse break;
+        if (std.mem.eql(u8, @tagName(parsed_mut), "assignment")) continue;
+
+        const ref, const pos = parsed_mut.expression;
 
         left = left[pos..];
+        var ast = Ast{ .root_ref = ref, .gc = gc.* };
 
-        const node = ast.eval(alloc) catch |e| switch (e) {
+        const node = ast.eval(gpa) catch |e| switch (e) {
             error.ExpectedFunction => {
                 std.log.err("expected a function, found non-function in '{s}'", .{prev});
+                continue;
+            },
+            error.InvalidGen => {
+                std.log.err("an unexpected gen was found", .{});
                 continue;
             },
             error.OutOfMemory => return e,
@@ -466,12 +494,12 @@ fn execute(alloc: Allocator, path: []const u8) !void {
             continue;
         };
 
-        const printable = try node.printable(alloc, &ast.gc);
+        const printable = try node.printable(gpa, &ast.gc);
         std.debug.print("{f}\n", .{printable});
     }
 }
 
-fn repl(alloc: Allocator) !void {
+fn repl(gpa: Allocator, gc: *Ast.GC) !void {
     const stdin = std.fs.File.stdin();
     defer stdin.close();
 
@@ -483,22 +511,34 @@ fn repl(alloc: Allocator) !void {
         const input = try stdin_reader.interface.takeDelimiter('\n') orelse continue;
         if (std.mem.eql(u8, input, ":q")) break;
 
-        const parsed = try parse(alloc, input) orelse break;
-        var ast, _ = parsed.expression;
-        defer ast.deinit(alloc);
+        const parsed_mut = try parseMutable(gpa, gc, input) orelse break;
+        if (std.mem.eql(u8, @tagName(parsed_mut), "assignment")) {
+            const got = gc.get(parsed_mut.assignment.@"1").?;
+            const printable = try got.printable(gpa, gc);
+            const name = parsed_mut.assignment.@"0";
+            std.log.info("assigned {f} to {s}", .{printable, name});
+            continue;
+        }
 
-        const res = ast.eval(alloc) catch |e| switch (e) {
+        const ref, _ = parsed_mut.expression;
+        var ast = Ast{ .root_ref = ref, .gc = gc.* };
+
+        const res = ast.eval(gpa) catch |e| switch (e) {
             error.ExpectedFunction => {
                 std.log.err("expected a function, found non-function", .{});
                 continue;
             },
+            error.InvalidGen => {
+                std.log.err("an unexpected gen was found", .{});
+                continue;
+            },
             error.OutOfMemory => return e,
         } orelse {
-            std.log.info("did not evaluate to a proper result\n", .{});
+            std.log.info("did not evaluate to a proper result", .{});
             continue;
         };
 
-        std.debug.print("{f}\n", .{try res.printable(alloc, &ast.gc)});
+        std.debug.print("{f}\n", .{try res.printable(gpa, &ast.gc)});
     }
 }
 
@@ -529,15 +569,18 @@ pub fn main() !void {
         return;
     };
 
+    var gc = Ast.GC.init(alloc);
+    defer gc.deinit(alloc);
+
     if (std.mem.eql(u8, first, "repl")) {
         if (args.next()) |path| {
-            try execute(alloc, path);
+            try executeMutable(alloc, &gc, path);
         }
-        try repl(alloc);
+        try repl(alloc, &gc);
         return;
     }
 
-    try execute(alloc, first);
+    try executeMutable(alloc, &gc, first);
 }
 
 test "lexer" {
@@ -588,15 +631,19 @@ test "parse assignment" {
             var writer_buf: [8192]u8 = undefined;
             var w = std.Io.Writer.fixed(&writer_buf);
 
-            const parsed = try parse(alloc, input) orelse return error.Unexpected;
-            if (!std.mem.eql(u8, @tagName(parsed), "assignment")) return error.Unexpected;
+            var gc = Ast.GC.init(alloc);
+            defer gc.deinit(alloc);
 
-            const n, var ast, _ = parsed.assignment;
-            defer ast.deinit(alloc);
+            const parsed_mut = try parseMutable(alloc, &gc, input) orelse return error.Unexpected;
+            if (!std.mem.eql(u8, @tagName(parsed_mut), "assignment")) return error.Unexpected;
+
+            const n, const ref, _ = parsed_mut.assignment;
 
             if (!std.mem.eql(u8, name, n)) return error.WrongName;
+            const node = (gc.get(ref) orelse return error.Unexpected).*;
+            const printable = try node.printable(alloc, &gc);
 
-            try w.print("{f}", .{ast});
+            try w.print("{f}", .{printable});
             const got_end = w.end;
             const got = writer_buf[0..got_end];
 
@@ -836,6 +883,97 @@ test "eval" {
     const ffxy = try ast.gc.make(gpa, .{ .function = .{ .arg = "f", .body = fxy } });
     const yffxy = try ast.gc.make(gpa, .{ .function = .{ .arg = "y", .body = ffxy } });
     ast.root_ref = try ast.gc.make(gpa, .{ .function = .{ .arg = "x", .body = yffxy } });
+    try expect(gpa, input, ast);
+    ast.clear(gpa);
+}
+
+test "eval with assignments" {
+    var debug = std.heap.DebugAllocator(.{}).init;
+    defer _ = debug.deinit();
+    const gpa = debug.allocator();
+
+    const expect = struct {
+        fn expect(alloc: Allocator, input: []const u8, expected: Ast) !void {
+            var writer_buf: [8192]u8 = undefined;
+            var w = std.Io.Writer.fixed(&writer_buf);
+
+            const parsed = try parse(alloc, input) orelse return error.Unexpected;
+            if (!std.mem.eql(u8, @tagName(parsed), "expression")) return error.Unexpected;
+
+            var ast, _ = parsed.expression;
+            defer ast.deinit(alloc);
+
+            var res = try ast.eval(alloc) orelse return error.Unexpected;
+            const printable = try res.printable(alloc, &ast.gc);
+
+            try w.print("{f}", .{printable});
+            const got_end = w.end;
+            const got = writer_buf[0..got_end];
+
+            try w.print("{f}", .{expected});
+            const exp = writer_buf[got_end..w.end];
+            try std.testing.expectEqualStrings(exp, got);
+        }
+    }.expect;
+
+    var ast = Ast.init(gpa);
+    errdefer ast.deinit(gpa);
+
+    var input: []const u8 =
+        \\ true = \x.y.x
+    ;
+    _ = try parseMutable(gpa, &ast.gc, input);
+
+    input =
+        \\ false = \x.y.y
+    ;
+    _ = try parseMutable(gpa, &ast.gc, input);
+
+    input =
+        \\ if = \x.x
+    ;
+    _ = try parseMutable(gpa, &ast.gc, input);
+
+    input =
+        \\ pair = \x.y.f.f x y
+    ;
+    _ = try parseMutable(gpa, &ast.gc, input);
+
+    input =
+        \\ fst = \p.p true
+    ;
+    _ = try parseMutable(gpa, &ast.gc, input);
+
+    input =
+        \\ snd = \p.p false
+    ;
+    _ = try parseMutable(gpa, &ast.gc, input);
+
+    input =
+        \\ if true 12 13
+    ;
+    ast.root_ref = try ast.gc.make(gpa, .{ .variable = "12" });
+    try expect(gpa, input, ast);
+    ast.clear(gpa);
+
+    input =
+        \\ if false 12 13
+    ;
+    ast.root_ref = try ast.gc.make(gpa, .{ .variable = "13" });
+    try expect(gpa, input, ast);
+    ast.clear(gpa);
+
+    input =
+        \\ fst (pair 33 34)
+    ;
+    ast.root_ref = try ast.gc.make(gpa, .{ .variable = "33" });
+    try expect(gpa, input, ast);
+    ast.clear(gpa);
+
+    input =
+        \\ snd (fst (pair 33 (pair 12 13))
+    ;
+    ast.root_ref = try ast.gc.make(gpa, .{ .variable = "13" });
     try expect(gpa, input, ast);
     ast.clear(gpa);
 }
