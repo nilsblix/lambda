@@ -2,6 +2,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 
+const safety_bound: usize = 500_000;
+
 const Ast = struct {
     root_ref: Node.Ref = 0,
     gc: GC = .{},
@@ -160,24 +162,28 @@ const Ast = struct {
 
         const EvalError = error{ExpectedFunction} || Allocator.Error;
 
-        fn eval(self: *const Node, gpa: Allocator, gc: *GC) EvalError!Ref {
+        fn eval(self: *const Node, gpa: Allocator, gc: *GC, level: usize) EvalError!Ref {
+            if (level > safety_bound) @panic("loop safety counter exceeded");
+
             switch (self.*) {
-                // TODO: Don't dupe this for no reason. Is there a way to find the
-                // reference even without a Node.eql function?
-                .variable, .function => return try gc.make(gpa, self.*),
+                // Snapshot before append: gc.make can grow and relocate storage.
+                .variable, .function => {
+                    const node = self.*;
+                    return try gc.make(gpa, node);
+                },
                 .app => |app| {
                     const f = f: {
                         // We know that all nodes get created via gc.make,
                         // therefore invalid state doesn't exist.
-                        const lhs = gc.get(app.lhs) orelse unreachable;
-                        const ret_ref = try lhs.eval(gpa, gc);
+                        const lhs = (gc.get(app.lhs) orelse unreachable).*;
+                        const ret_ref = try lhs.eval(gpa, gc, level + 1);
                         const ret = gc.get(ret_ref) orelse unreachable;
                         if (ret.* != .function) return error.ExpectedFunction;
                         break :f ret.*.function;
                     };
 
-                    const rhs = gc.get(app.rhs) orelse unreachable;
-                    const replacement_ref = try rhs.eval(gpa, gc);
+                    const rhs = (gc.get(app.rhs) orelse unreachable).*;
+                    const replacement_ref = try rhs.eval(gpa, gc, level + 1);
 
                     return try replace(gpa, gc, f.arg, f.body, replacement_ref);
                 },
@@ -187,7 +193,7 @@ const Ast = struct {
 
     fn eval(self: *Ast, gpa: Allocator) Node.EvalError!?Node {
         const r = self.gc.get(self.root_ref) orelse return null;
-        const ref = try r.eval(gpa, &self.gc);
+        const ref = try r.eval(gpa, &self.gc, 0);
         const ptr = self.gc.get(ref) orelse return null;
         return ptr.*;
     }
@@ -304,16 +310,7 @@ fn nextExpression(gpa: Allocator, gc: *Ast.GC, l: *Lexer) Allocator.Error!?Ast.N
             return try gc.make(gpa, Ast.Node{ .function = .{ .arg = arg, .body = body } });
         },
         .oparen => {
-            const f = f: {
-                const ret_ref = try nextExpression(gpa, gc, l) orelse return null;
-                const ret = gc.get(ret_ref) orelse unreachable;
-                if (ret.* != .function) {
-                    const print = try ret.printable(gpa, gc);
-                    std.log.err("expected function expression, found `{f}`", .{print});
-                    return null;
-                }
-                break :f ret_ref;
-            };
+            const f = try nextExpression(gpa, gc, l) orelse return null;
 
             const arg = try nextExpression(gpa, gc, l) orelse return null;
 
@@ -344,27 +341,37 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    const f = std.fs.File.stdout();
-    defer f.close();
+    const input =
+        \\ (\x.(x x) \x.(x x))
+    ;
 
-    var reader_buf: [4096]u8 = undefined;
-    var reader = f.reader(&reader_buf);
+    var ast, _ = try parse(alloc, input) orelse return;
+    defer ast.deinit(alloc);
 
-    while (true) {
-        std.debug.print("@> ", .{});
-        const input = try reader.interface.takeDelimiter('\n') orelse continue;
-        if (std.mem.eql(u8, input, ":quit")) break;
+    const res = try ast.eval(alloc) orelse unreachable;
+    std.debug.print("{f}\n", .{try res.printable(alloc, &ast.gc)});
 
-        var ast, _ = try parse(alloc, input) orelse continue;
-        defer ast.deinit(alloc);
-
-        const res = try ast.eval(alloc) orelse {
-            std.debug.print("info: did not evaluate to a proper result\n", .{});
-            continue;
-        };
-
-        std.debug.print("{f}\n", .{res});
-    }
+    // const f = std.fs.File.stdin();
+    // defer f.close();
+    //
+    // var reader_buf: [4096]u8 = undefined;
+    // var reader = f.reader(&reader_buf);
+    //
+    // while (true) {
+    //     std.debug.print("@> ", .{});
+    //     const input = try reader.interface.takeDelimiter('\n') orelse continue;
+    //     if (std.mem.eql(u8, input, ":quit")) break;
+    //
+    //     var ast, _ = try parse(alloc, input) orelse continue;
+    //     defer ast.deinit(alloc);
+    //
+    //     const res = try ast.eval(alloc) orelse {
+    //         std.debug.print("info: did not evaluate to a proper result\n", .{});
+    //         continue;
+    //     };
+    //
+    //     std.debug.print("{f}\n", .{try res.printable(alloc, &ast.gc)});
+    // }
 }
 
 test "parse expression and deinit" {
@@ -391,6 +398,8 @@ test "parse expression and deinit" {
     }.expect;
 
     var ast = Ast{};
+    errdefer ast.deinit(gpa);
+
     ast.root_ref = try ast.gc.make(gpa, .{ .variable = "var" });
     try expect(gpa, "   var     ", ast);
     ast.clear(gpa);
@@ -425,6 +434,16 @@ test "parse expression and deinit" {
     try expect(gpa, input, ast);
     ast.root_ref = 4;
     try expect(gpa, input[15..], ast);
+    ast.clear(gpa);
+
+    input =
+        \\ (\x.(x x) \x.(x x))
+    ;
+    const x = try ast.gc.make(gpa, .{ .variable = "x" });
+    const x_x = try ast.gc.make(gpa, .{ .app = .{ .lhs = x, .rhs = x }});
+    const rec = try ast.gc.make(gpa, .{ .function = .{ .arg = "x", .body = x_x }});
+    ast.root_ref = try ast.gc.make(gpa, .{ .app = .{ .lhs = rec, .rhs = rec }});
+    try expect(gpa, input, ast);
     ast.clear(gpa);
 }
 
@@ -493,85 +512,35 @@ test "eval" {
     }.expect;
 
     var ast = Ast{};
+    errdefer ast.deinit(gpa);
+
     var input: []const u8 =
-        \\ variable
+        \\ variable
     ;
     ast.root_ref = try ast.gc.make(gpa, .{ .variable = "variable" });
     try expect(gpa, input, ast);
     ast.clear(gpa);
 
     input =
-        \\ \x.x
+        \\ \x.x          
     ;
     _ = try ast.gc.make(gpa, .{ .variable = "x" });
     ast.root_ref = try ast.gc.make(gpa, .{ .function = .{ .arg = "x", .body = 0 }});
     try expect(gpa, input, ast);
     ast.clear(gpa);
-}
 
-// test "eval variable" {
-//     var debug = std.heap.DebugAllocator(.{}).init;
-//     defer _ = debug.deinit();
-//     var arena_instance = std.heap.ArenaAllocator.init(debug.allocator());
-//     defer arena_instance.deinit();
-//
-//     const expr = Ast.Node{
-//         .variable = "x y",
-//     };
-//
-//     const ret = try expr.eval(arena_instance.allocator());
-//     const exp = Ast.Node{ .variable = "x y" };
-//     try std.testing.expect(ret.eql(exp));
-// }
-//
-// test "eval function" {
-//     var debug = std.heap.DebugAllocator(.{}).init;
-//     defer _ = debug.deinit();
-//     var arena_instance = std.heap.ArenaAllocator.init(debug.allocator());
-//     defer arena_instance.deinit();
-//
-//     const expr = Ast.Node{
-//         .function = .{
-//             .arg = "x",
-//             .body = @constCast(&Ast.Node{
-//                 .variable = "x",
-//             }),
-//         },
-//     };
-//
-//     const ret = try expr.eval(arena_instance.allocator());
-//     const exp = Ast.Node{
-//         .function = .{
-//             .arg = "x",
-//             .body = @constCast(&Ast.Node{
-//                 .variable = "x",
-//             }),
-//         },
-//     };
-//     try std.testing.expect(ret.eql(exp));
-// }
-//
-// test "eval simple application" {
-//     var debug = std.heap.DebugAllocator(.{}).init;
-//     defer _ = debug.deinit();
-//     var arena_instance = std.heap.ArenaAllocator.init(debug.allocator());
-//     defer arena_instance.deinit();
-//
-//     const expr = Ast.Node{
-//         .app = .{
-//             .lhs = @constCast(&Ast.Node{
-//                 .function = .{
-//                     .arg = "x",
-//                     .body = @constCast(&Ast.Node{
-//                         .variable = "x",
-//                     }),
-//                 },
-//             }),
-//             .rhs = @constCast(&Ast.Node{ .variable = "y" }),
-//         },
-//     };
-//
-//     const ret = try expr.eval(arena_instance.allocator());
-//     const exp = Ast.Node{ .variable = "y" };
-//     try std.testing.expect(ret.eql(exp));
-// }
+    input =
+        \\ (\x.x y)
+    ;
+    ast.root_ref = try ast.gc.make(gpa, .{ .variable = "y" });
+    try expect(gpa, input, ast);
+    ast.clear(gpa);
+
+    input =
+        \\ (\x.\f.x y)
+    ;
+    _ = try ast.gc.make(gpa, .{ .variable = "y" });
+    ast.root_ref = try ast.gc.make(gpa, .{ .function = .{ .arg = "f", .body = 0 }});
+    try expect(gpa, input, ast);
+    ast.clear(gpa);
+}
