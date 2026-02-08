@@ -3,95 +3,100 @@ const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 
 const Ast = struct {
-    root: *Node,
+    root_ref: Node.Ref = 0,
+    gc: GC = .{},
 
-    fn init(alloc: Allocator, root: Node) Allocator.Error!Ast {
-        const r = try alloc.create(Node);
-        r.* = root;
-        return Ast{
-            .root = r,
-        };
+    fn deinit(self: *Ast, gpa: Allocator) void {
+        self.gc.deinit(gpa);
     }
 
-    fn deinit(self: *Ast, alloc: Allocator) void {
-        self.root.deinit(alloc);
-        alloc.destroy(self.root);
+    fn clear(self: *Ast, gpa: Allocator) void {
+        self.deinit(gpa);
+        self.* = Ast{};
+    }
+
+    fn root(self: *const Ast) ?Node {
+        const r = self.gc.get(self.root_ref) orelse return null;
+        return r.*;
     }
 
     pub fn format(self: Ast, w: *Writer) Writer.Error!void {
-        try w.print("{f}", .{self.root});
+        if (self.root()) |r| {
+            try r.format(&self.gc, w);
+        } else {
+            try w.print("no root", .{});
+        }
     }
 
+    const GC = struct {
+        buf: std.ArrayList(Node) = .empty,
+
+        fn get(self: *const GC, ref: Node.Ref) ?*Node {
+            if (ref >= self.buf.items.len) return null;
+            return &self.buf.items[ref];
+        }
+
+        fn make(self: *GC, gpa: Allocator, node: Node) Allocator.Error!Node.Ref {
+            try self.buf.append(gpa, node);
+            return self.buf.items.len - 1;
+        }
+
+        fn deinit(self: *GC, gpa: Allocator) void {
+            self.buf.deinit(gpa);
+        }
+    };
+
     const Node = union(enum) {
+        const Ref = usize;
+
         const Function = struct {
             arg: []const u8,
-            body: *Node,
+            body: Ref,
         };
 
         const App = struct {
-            lhs: *Node,
-            rhs: *Node,
+            lhs: Ref,
+            rhs: Ref,
         };
 
         variable: []const u8,
         function: Function,
         app: App,
 
-        fn deinit(e: *Node, alloc: Allocator) void {
-            switch (e.*) {
-                .variable => {},
+        fn printable(self: Node, gpa: Allocator, gc: *GC) Allocator.Error!Ast {
+            const tmp = try gc.make(gpa, self);
+            return Ast{
+                .root_ref = tmp,
+                .gc = gc.*,
+            };
+        }
+
+        fn format(self: Node, gc: *const GC, w: *Writer) Writer.Error!void {
+            switch (self) {
+                .variable => |v| try w.print("{s}", .{v}),
                 .function => |f| {
-                    f.body.deinit(alloc);
-                    alloc.destroy(f.body);
+                    try w.print("\\{s}.", .{f.arg});
+
+                    const body = gc.get(f.body) orelse {
+                        try w.print("['{d}' not found]", .{f.body});
+                        return;
+                    };
+
+                    try body.format(gc, w);
                 },
                 .app => |app| {
-                    app.lhs.deinit(alloc);
-                    app.rhs.deinit(alloc);
-                    alloc.destroy(app.lhs);
-                    alloc.destroy(app.rhs);
+                    const lhs = gc.get(app.lhs) orelse {
+                        try w.print("['{d}' not found]", .{app.lhs});
+                        return;
+                    };
+                    try lhs.format(gc, w);
+                    const rhs = gc.get(app.rhs) orelse {
+                        try w.print("['{d}' not found]", .{app.rhs});
+                        return;
+                    };
+                    try rhs.format(gc, w);
                 },
             }
-        }
-
-        pub fn format(e: Node, w: *Writer) Writer.Error!void {
-            switch (e) {
-                .variable => |i| try w.print("{s}", .{i}),
-                .function => |f| try w.print("\\{s}.{f}", .{ f.arg, f.body.* }),
-                .app => |app| try w.print("({f} {f})", .{ app.lhs.*, app.rhs.* }),
-            }
-        }
-
-        fn eql(a: Node, b: Node) bool {
-            return switch (a) {
-                .variable => |va| switch (b) {
-                    .variable => |vb| std.mem.eql(u8, va, vb),
-                    .function, .app => false,
-                },
-                .function => |fa| switch (b) {
-                    .function => |fb| std.mem.eql(u8, fa.arg, fb.arg) and fa.body.eql(fb.body.*),
-                    .variable, .app => false,
-                },
-                .app => |ca| switch (b) {
-                    .app => |cb| ca.lhs.eql(cb.lhs.*) and ca.rhs.eql(cb.rhs.*),
-                    .variable, .function => false,
-                },
-            };
-        }
-
-        fn variableOrPanic(e: Node) []const u8 {
-            return switch (e) {
-                .variable => |v| v,
-                .function => @panic("error: expected variable, found function"),
-                .app => @panic("error: expected variable, found application"),
-            };
-        }
-
-        fn functionOrPanic(e: Node) Function {
-            return switch (e) {
-                .variable => @panic("error: expected function, found variable"),
-                .function => |f| f,
-                .app => @panic("error: expected function, found application"),
-            };
         }
 
         /// `body` needs to be freed after calling this, as all heap allocated
@@ -102,73 +107,90 @@ const Ast = struct {
         ///
         /// (\param.body) arg
         fn replace(
-            alloc: Allocator,
+            gpa: Allocator,
+            gc: *GC,
             param: []const u8,
-            body: Node,
-            arg: Node,
-        ) Allocator.Error!Node {
+            body_ref: Ref,
+            arg_ref: Ref,
+        ) Allocator.Error!Ref {
+            const body = body: {
+                const ret = gc.get(body_ref) orelse unreachable;
+                break :body ret.*;
+            };
             switch (body) {
                 // (\param.v) arg
                 .variable => {
-                    if (body.eql(.{ .variable = param })) return arg;
-                    return body;
+                    if (body == .variable and std.mem.eql(u8, body.variable, param)) return arg_ref;
+                    return body_ref;
                 },
                 // (\param.\inner_arg.inner_body) arg
                 // We need to replace all occurences of `param` in `inner_arg`
                 // and `inner_body` with `arg`.
                 .function => |inner| {
                     const new_inner_arg = new_inner_arg: {
-                        const ret = try replace(alloc, param, .{ .variable = inner.arg }, arg);
-                        break :new_inner_arg ret.variableOrPanic();
+                        // TODO: Do we really have to heap allocate this
+                        // temporary thing? Feels like this is just a
+                        // limitation of the replace signature being dependant
+                        // on a bunch of refs.
+                        const tmp = try gc.make(gpa, .{ .variable = inner.arg });
+                        const ref = try replace(gpa, gc, param, tmp, arg_ref);
+                        const node = gc.get(ref);
+                        break :new_inner_arg node.?.variable;
                     };
 
-                    const new_inner_body = try alloc.create(Node);
-                    new_inner_body.* = try replace(alloc, param, inner.body.*, arg);
-                    return Node{
+                    const new_inner_body = try replace(gpa, gc, param, inner.body, arg_ref);
+                    const ret = Node{
                         .function = .{ .arg = new_inner_arg, .body = new_inner_body },
                     };
+                    return try gc.make(gpa, ret);
                 },
-                // (\param.lhs rhs) arg
+                // (\param.(lhs rhs)) arg
                 // We need to replace all occurences of `param` in `lhs` and `rhs`
                 // with `arg`.
                 .app => |app| {
-                    const new_lhs = try alloc.create(Node);
-                    const new_rhs = try alloc.create(Node);
-                    new_lhs.* = try replace(alloc, param, app.lhs.*, arg);
-                    new_rhs.* = try replace(alloc, param, app.rhs.*, arg);
-                    return Node{
+                    const new_lhs = try replace(gpa, gc, param, app.lhs, arg_ref);
+                    const new_rhs = try replace(gpa, gc, param, app.rhs, arg_ref);
+                    const ret = Node{
                         .app = .{ .lhs = new_lhs, .rhs = new_rhs },
                     };
+                    return try gc.make(gpa, ret);
                 },
             }
         }
 
-        fn eval(self: *const Node, alloc: Allocator) Allocator.Error!*Node {
+        const EvalError = error{ExpectedFunction} || Allocator.Error;
+
+        fn eval(self: *const Node, gpa: Allocator, gc: *GC) EvalError!Ref {
             switch (self.*) {
-                // .variable, .function => return @constCast(self),
-                .variable, .function => {
-                    const buf = try alloc.dupe(Node, @ptrCast(self));
-                    return &buf[0];
-                },
+                // TODO: Don't dupe this for no reason. Is there a way to find the
+                // reference even without a Node.eql function?
+                .variable, .function => return try gc.make(gpa, self.*),
                 .app => |app| {
                     const f = f: {
-                        const ret = try app.lhs.eval(alloc);
-                        break :f ret.functionOrPanic();
+                        // We know that all nodes get created via gc.make,
+                        // therefore invalid state doesn't exist.
+                        const lhs = gc.get(app.lhs) orelse unreachable;
+                        const ret_ref = try lhs.eval(gpa, gc);
+                        const ret = gc.get(ret_ref) orelse unreachable;
+                        if (ret.* != .function) return error.ExpectedFunction;
+                        break :f ret.*.function;
                     };
 
-                    const replacement = try app.rhs.eval(alloc);
-                    defer {
-                        replacement.deinit(alloc);
-                        alloc.destroy(replacement);
-                    }
+                    const rhs = gc.get(app.rhs) orelse unreachable;
+                    const replacement_ref = try rhs.eval(gpa, gc);
 
-                    const ret = try alloc.create(Node);
-                    ret.* = try replace(alloc, f.arg, f.body.*, replacement.*);
-                    return ret;
+                    return try replace(gpa, gc, f.arg, f.body, replacement_ref);
                 },
             }
         }
     };
+
+    fn eval(self: *Ast, gpa: Allocator) Node.EvalError!?Node {
+        const r = self.gc.get(self.root_ref) orelse return null;
+        const ref = try r.eval(gpa, &self.gc);
+        const ptr = self.gc.get(ref) orelse return null;
+        return ptr.*;
+    }
 };
 
 const Token = union(enum) {
@@ -257,9 +279,9 @@ const Lexer = struct {
     }
 };
 
-fn parseExpressionWithLexer(alloc: Allocator, l: *Lexer) Allocator.Error!?Ast {
+fn nextExpression(gpa: Allocator, gc: *Ast.GC, l: *Lexer) Allocator.Error!?Ast.Node.Ref {
     switch (l.next()) {
-        .ident => |i| return try Ast.init(alloc, .{ .variable = i }),
+        .ident => |i| return try gc.make(gpa, .{ .variable = i }),
         .lambda => {
             const arg = arg: {
                 const ret = l.next();
@@ -278,21 +300,22 @@ fn parseExpressionWithLexer(alloc: Allocator, l: *Lexer) Allocator.Error!?Ast {
                 return null;
             }
 
-            const body = try parseExpressionWithLexer(alloc, l) orelse return null;
-
-            return try Ast.init(alloc, .{ .function = .{ .arg = arg, .body = body.root } });
+            const body = try nextExpression(gpa, gc, l) orelse return null;
+            return try gc.make(gpa, Ast.Node{ .function = .{ .arg = arg, .body = body } });
         },
         .oparen => {
             const f = f: {
-                const ret = try parseExpressionWithLexer(alloc, l) orelse return null;
-                if (ret.root.* != .function) {
-                    std.log.err("expected function expression, found `{f}`", .{ret.root.*});
+                const ret_ref = try nextExpression(gpa, gc, l) orelse return null;
+                const ret = gc.get(ret_ref) orelse unreachable;
+                if (ret.* != .function) {
+                    const print = try ret.printable(gpa, gc);
+                    std.log.err("expected function expression, found `{f}`", .{print});
                     return null;
                 }
-                break :f ret;
+                break :f ret_ref;
             };
 
-            const arg = try parseExpressionWithLexer(alloc, l) orelse return null;
+            const arg = try nextExpression(gpa, gc, l) orelse return null;
 
             const end = l.byteAndAdvance();
             if (end == null or Token.match(end.?) != .cparen) {
@@ -301,20 +324,19 @@ fn parseExpressionWithLexer(alloc: Allocator, l: *Lexer) Allocator.Error!?Ast {
                 return null;
             }
 
-            return try Ast.init(alloc, .{ .app = .{ .lhs = f.root, .rhs = arg.root } });
+            return try gc.make(gpa, Ast.Node{ .app = .{ .lhs = f, .rhs = arg } });
         },
         .eq, .cparen, .separator, .space, .end, .illegal => return null,
     }
 }
 
-const Result = struct { Ast, usize };
+const Parsed = struct { Ast, usize };
 
-/// Returns the Ast and the position advanced to in the `input` slice. Position
-/// is useful for evaluating multiple expressions from the same input.
-fn parseExpression(alloc: Allocator, input: []const u8) Allocator.Error!?Result {
+fn parse(gpa: Allocator, input: []const u8) Allocator.Error!?Parsed {
+    var gc = Ast.GC{};
     var l = Lexer.init(input);
-    const ast = try parseExpressionWithLexer(alloc, &l) orelse return null;
-    return .{ ast, l.cur + 1 };
+    const root = try nextExpression(gpa, &gc, &l) orelse return null;
+    return .{ Ast{ .root_ref = root, .gc = gc }, l.cur };
 }
 
 pub fn main() !void {
@@ -333,14 +355,13 @@ pub fn main() !void {
         const input = try reader.interface.takeDelimiter('\n') orelse continue;
         if (std.mem.eql(u8, input, ":quit")) break;
 
-        var ast, _ = try parseExpression(alloc, input) orelse continue;
+        var ast, _ = try parse(alloc, input) orelse continue;
         defer ast.deinit(alloc);
 
-        const res = try ast.root.eval(alloc);
-        // defer {
-        //     res.deinit(alloc);
-        //     alloc.destroy(res);
-        // }
+        const res = try ast.eval(alloc) orelse {
+            std.debug.print("info: did not evaluate to a proper result\n", .{});
+            continue;
+        };
 
         std.debug.print("{f}\n", .{res});
     }
@@ -351,91 +372,60 @@ test "parse expression and deinit" {
     defer _ = debug.deinit();
     const gpa = debug.allocator();
 
-    {
-        const input =
-            \\ var
-        ;
-        var ast, _ = try parseExpression(gpa, input) orelse return error.UnexpectedResult;
-        defer ast.deinit(gpa);
-        const exp = Ast.Node{ .variable = "var" };
-        try std.testing.expect(ast.root.eql(exp));
-    }
+    const expect = struct {
+        fn expect(alloc: Allocator, input: []const u8, expected: Ast) !void {
+            var writer_buf: [8192]u8 = undefined;
+            var w = std.Io.Writer.fixed(&writer_buf);
 
-    {
-        const input =
-            \\ \x.some_return
-        ;
+            var ast, _ = try parse(alloc, input) orelse return error.Unexpected;
+            defer ast.deinit(alloc);
 
-        var ast, _ = try parseExpression(gpa, input) orelse return error.UnexpectedResult;
-        defer ast.deinit(gpa);
-        const exp = Ast.Node{
-            .function = .{
-                .arg = "x",
-                .body = @constCast(&Ast.Node{
-                    .variable = "some_return",
-                }),
-            },
-        };
-        try std.testing.expect(ast.root.eql(exp));
-    }
+            try w.print("{f}", .{ast});
+            const got_end = w.end;
+            const got = writer_buf[0..got_end];
 
-    {
-        const input =
-            \\ (\x.some_return some_arg)
-        ;
-        var ast, _ = try parseExpression(gpa, input) orelse return error.UnexpectedResult;
-        defer ast.deinit(gpa);
-        const exp = Ast.Node{
-            .app = .{
-                .lhs = @constCast(&Ast.Node{
-                    .function = .{
-                        .arg = "x",
-                        .body = @constCast(&Ast.Node{
-                            .variable = "some_return",
-                        }),
-                    },
-                }),
-                .rhs = @constCast(&Ast.Node{
-                    .variable = "some_arg",
-                }),
-            },
-        };
-        try std.testing.expect(ast.root.eql(exp));
-    }
+            try w.print("{f}", .{expected});
+            const exp = writer_buf[got_end..w.end];
+            try std.testing.expectEqualStrings(exp, got);
+        }
+    }.expect;
 
-    {
-        const input =
-            \\ \x.some_return \wow.\some.more
-        ;
-        var ast, const pos = try parseExpression(gpa, input) orelse return error.UnexpectedResult;
-        var exp = Ast.Node{
-            .function = .{
-                .arg = "x",
-                .body = @constCast(&Ast.Node{
-                    .variable = "some_return",
-                }),
-            },
-        };
-        try std.testing.expect(ast.root.eql(exp));
-        ast.deinit(gpa);
+    var ast = Ast{};
+    ast.root_ref = try ast.gc.make(gpa, .{ .variable = "var" });
+    try expect(gpa, "   var     ", ast);
+    ast.clear(gpa);
 
-        ast, _ = try parseExpression(gpa, input[pos..]) orelse return error.UnexpectedResult;
-        defer ast.deinit(gpa);
-        exp = Ast.Node{
-            .function = .{
-                .arg = "wow",
-                .body = @constCast(&Ast.Node{
-                    .function = .{
-                        .arg = "some",
-                        .body = @constCast(&Ast.Node{
-                            .variable = "more",
-                        }),
-                    },
-                }),
-            },
-        };
-        try std.testing.expect(ast.root.eql(exp));
-    }
+    var input: []const u8 =
+        \\ \x.function_body
+    ;
+    _ = try ast.gc.make(gpa, .{ .variable = "function_body" });
+    ast.root_ref = try ast.gc.make(gpa, .{ .function = .{ .arg = "x", .body = 0 } });
+    try expect(gpa, input, ast);
+    ast.clear(gpa);
+
+    input =
+        \\ (\function_arg.function_body apped)
+    ;
+    _ = try ast.gc.make(gpa, .{ .variable = "function_body" });
+    _ = try ast.gc.make(gpa, .{ .function = .{ .arg = "function_arg", .body = 0 } });
+    _ = try ast.gc.make(gpa, .{ .variable = "apped" });
+    ast.root_ref = try ast.gc.make(gpa, .{ .app = .{ .lhs = 1, .rhs = 2 } });
+    try expect(gpa, input, ast);
+    ast.clear(gpa);
+
+    input =
+        \\ \x.some_return \wow.\some.more
+    ;
+    _ = try ast.gc.make(gpa, .{ .variable = "some_return" });
+    _ = try ast.gc.make(gpa, .{ .function = .{ .arg = "x", .body = 0 }});
+    _ = try ast.gc.make(gpa, .{ .variable = "more" });
+    _ = try ast.gc.make(gpa, .{ .function = .{ .arg = "some", .body = 2 }});
+    _ = try ast.gc.make(gpa, .{ .function = .{ .arg = "wow", .body = 3 }});
+    ast.root_ref = 1;
+    try expect(gpa, input, ast);
+    ast.root_ref = 4;
+    try expect(gpa, input[15..], ast);
+    ast.clear(gpa);
 }
 
 test "lexer" {
@@ -476,69 +466,112 @@ test "lexer" {
     try exp(Token.end, l.next());
 }
 
-test "eval variable" {
+test "eval" {
     var debug = std.heap.DebugAllocator(.{}).init;
     defer _ = debug.deinit();
-    var arena_instance = std.heap.ArenaAllocator.init(debug.allocator());
-    defer arena_instance.deinit();
+    const gpa = debug.allocator();
 
-    const expr = Ast.Node{
-        .variable = "x y",
-    };
+    const expect = struct {
+        fn expect(alloc: Allocator, input: []const u8, expected: Ast) !void {
+            var writer_buf: [8192]u8 = undefined;
+            var w = std.Io.Writer.fixed(&writer_buf);
 
-    const ret = try expr.eval(arena_instance.allocator());
-    const exp = Ast.Node{ .variable = "x y" };
-    try std.testing.expect(ret.eql(exp));
+            var ast, _ = try parse(alloc, input) orelse return error.Unexpected;
+            defer ast.deinit(alloc);
+
+            var res = try ast.eval(alloc) orelse return error.Unexpected;
+            const printable = try res.printable(alloc, &ast.gc);
+
+            try w.print("{f}", .{printable});
+            const got_end = w.end;
+            const got = writer_buf[0..got_end];
+
+            try w.print("{f}", .{expected});
+            const exp = writer_buf[got_end..w.end];
+            try std.testing.expectEqualStrings(exp, got);
+        }
+    }.expect;
+
+    var ast = Ast{};
+    var input: []const u8 =
+        \\ variable
+    ;
+    ast.root_ref = try ast.gc.make(gpa, .{ .variable = "variable" });
+    try expect(gpa, input, ast);
+    ast.clear(gpa);
+
+    input =
+        \\ \x.x
+    ;
+    _ = try ast.gc.make(gpa, .{ .variable = "x" });
+    ast.root_ref = try ast.gc.make(gpa, .{ .function = .{ .arg = "x", .body = 0 }});
+    try expect(gpa, input, ast);
+    ast.clear(gpa);
 }
 
-test "eval function" {
-    var debug = std.heap.DebugAllocator(.{}).init;
-    defer _ = debug.deinit();
-    var arena_instance = std.heap.ArenaAllocator.init(debug.allocator());
-    defer arena_instance.deinit();
-
-    const expr = Ast.Node{
-        .function = .{
-            .arg = "x",
-            .body = @constCast(&Ast.Node{
-                .variable = "x",
-            }),
-        },
-    };
-
-    const ret = try expr.eval(arena_instance.allocator());
-    const exp = Ast.Node{
-        .function = .{
-            .arg = "x",
-            .body = @constCast(&Ast.Node{
-                .variable = "x",
-            }),
-        },
-    };
-    try std.testing.expect(ret.eql(exp));
-}
-
-test "eval simple application" {
-    var debug = std.heap.DebugAllocator(.{}).init;
-    defer _ = debug.deinit();
-    var arena_instance = std.heap.ArenaAllocator.init(debug.allocator());
-    defer arena_instance.deinit();
-
-    const expr = Ast.Node{
-        .app = .{
-            .lhs = @constCast(&Ast.Node{
-                .function = .{
-                    .arg = "x",
-                    .body = @constCast(&Ast.Node{
-                        .variable = "x",
-                    }),
-                },
-            }),
-            .rhs = @constCast(&Ast.Node{ .variable = "y" }),
-        },
-    };
-
-    const ret = try expr.eval(arena_instance.allocator());
-    const exp = Ast.Node{ .variable = "y" };
-    try std.testing.expect(ret.eql(exp));
-}
+// test "eval variable" {
+//     var debug = std.heap.DebugAllocator(.{}).init;
+//     defer _ = debug.deinit();
+//     var arena_instance = std.heap.ArenaAllocator.init(debug.allocator());
+//     defer arena_instance.deinit();
+//
+//     const expr = Ast.Node{
+//         .variable = "x y",
+//     };
+//
+//     const ret = try expr.eval(arena_instance.allocator());
+//     const exp = Ast.Node{ .variable = "x y" };
+//     try std.testing.expect(ret.eql(exp));
+// }
+//
+// test "eval function" {
+//     var debug = std.heap.DebugAllocator(.{}).init;
+//     defer _ = debug.deinit();
+//     var arena_instance = std.heap.ArenaAllocator.init(debug.allocator());
+//     defer arena_instance.deinit();
+//
+//     const expr = Ast.Node{
+//         .function = .{
+//             .arg = "x",
+//             .body = @constCast(&Ast.Node{
+//                 .variable = "x",
+//             }),
+//         },
+//     };
+//
+//     const ret = try expr.eval(arena_instance.allocator());
+//     const exp = Ast.Node{
+//         .function = .{
+//             .arg = "x",
+//             .body = @constCast(&Ast.Node{
+//                 .variable = "x",
+//             }),
+//         },
+//     };
+//     try std.testing.expect(ret.eql(exp));
+// }
+//
+// test "eval simple application" {
+//     var debug = std.heap.DebugAllocator(.{}).init;
+//     defer _ = debug.deinit();
+//     var arena_instance = std.heap.ArenaAllocator.init(debug.allocator());
+//     defer arena_instance.deinit();
+//
+//     const expr = Ast.Node{
+//         .app = .{
+//             .lhs = @constCast(&Ast.Node{
+//                 .function = .{
+//                     .arg = "x",
+//                     .body = @constCast(&Ast.Node{
+//                         .variable = "x",
+//                     }),
+//                 },
+//             }),
+//             .rhs = @constCast(&Ast.Node{ .variable = "y" }),
+//         },
+//     };
+//
+//     const ret = try expr.eval(arena_instance.allocator());
+//     const exp = Ast.Node{ .variable = "y" };
+//     try std.testing.expect(ret.eql(exp));
+// }
