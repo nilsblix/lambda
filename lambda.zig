@@ -163,23 +163,17 @@ const Ast = struct {
             }
         }
 
-        const EvalError = error{ExpectedFunction} || Allocator.Error;
+        const Error = error{ExpectedFunction} || Allocator.Error;
 
-        fn eval(self: *const Node, gpa: Allocator, gc: *GC) EvalError!Ref {
-            switch (self.*) {
-                // Snapshot before append: gc.make can grow and relocate storage.
-                .variable, .function => {
-                    const node = self.*;
-                    return try gc.make(gpa, node);
-                },
+        fn evalFromRef(gpa: Allocator, gc: *GC, ref: Ref) Error!Ref {
+            const node = gc.get(ref).?.*;
+            switch (node) {
+                // Snapshot before append such that gc.make can grow and
+                // relocate storage.
+                .variable, .function => return try gc.make(gpa, node),
                 .app => |app| {
-                    // We know that all nodes get created via gc.make,
-                    // therefore invalid state doesn't exist.
-                    const lhs = (gc.get(app.lhs) orelse unreachable).*;
-                    const function_ref = try lhs.eval(gpa, gc);
-
-                    const rhs = (gc.get(app.rhs) orelse unreachable).*;
-                    const replacement_ref = try rhs.eval(gpa, gc);
+                    const function_ref = try Node.evalFromRef(gpa, gc, app.lhs);
+                    const replacement_ref = try evalFromRef(gpa, gc, app.rhs);
 
                     const f = gc.get(function_ref) orelse unreachable;
                     if (f.* != .function) return error.ExpectedFunction;
@@ -189,15 +183,13 @@ const Ast = struct {
         }
     };
 
-    fn eval(self: *Ast, gpa: Allocator) Node.EvalError!?Node {
-        const r = self.gc.get(self.root_ref) orelse return null;
-        var ref = try r.eval(gpa, &self.gc);
+    fn eval(self: *Ast, gpa: Allocator) Node.Error!?Node {
+        var ref = try Node.evalFromRef(gpa, &self.gc, self.root_ref);
 
         for (0..safety_bound) |_| {
             const ptr = self.gc.get(ref) orelse return null;
             if (ptr.* != .app) return ptr.*;
-            const next = ptr.*;
-            ref = try next.eval(gpa, &self.gc);
+            ref = try Node.evalFromRef(gpa, &self.gc, ref);
         } else @panic("loop safety counter exceeded");
     }
 };
@@ -210,6 +202,7 @@ const Token = union(enum) {
     cparen,
     separator,
     space,
+    newline,
     comment,
     end,
     illegal,
@@ -221,7 +214,8 @@ const Token = union(enum) {
             '(' => .oparen,
             ')' => .cparen,
             '.' => .separator,
-            ' ', '\n', '\r', '\t' => .space,
+            ' ', '\r', '\t' => .space,
+            '\n' => .newline,
             ';' => .comment,
             0 => .end,
             else => .{ .ident = "" },
@@ -260,14 +254,27 @@ const Lexer = struct {
         return b;
     }
 
+    fn skipTo(self: *Lexer, tok: Token) void {
+        while (true) {
+            const b = self.peekByte() orelse break;
+            if (Token.match(b).kindEql(tok)) break;
+
+            _ = self.byteAndAdvance();
+        }
+    }
+
     fn next(self: *Lexer) Token {
         var start = self.cur;
         var b = self.byteAndAdvance() orelse return .end;
         const tok = Token.match(b);
         switch (tok) {
-            .eq, .lambda, .oparen, .cparen, .separator, .comment, .end, .illegal => return tok,
+            .eq, .lambda, .oparen, .cparen, .separator, .end, .illegal => return tok,
+            .comment => {
+                self.skipTo(.newline);
+                return .comment;
+            },
             // FIXME: Don't do recursion, chop instead whitespace.
-            .space => return self.next(),
+            .space, .newline => return self.next(),
             .ident => {
                 // We support overloaded identifiers with @"..." syntax,
                 // therefore we need to check if we are overloading or not.
@@ -303,6 +310,7 @@ const Lexer = struct {
     // Does not check the inside of `ident`. Simply expecting the kind.
     fn expect(self: *Lexer, expected: Token) ?void {
         if (!self.peek().kindEql(expected)) return null;
+        return {};
     }
 
     fn consume(self: *Lexer) void {
@@ -338,110 +346,88 @@ fn parseFunction(gpa: Allocator, gc: *Ast.GC, l: *Lexer) Allocator.Error!?Ast.No
     return try gc.make(gpa, .{ .function = .{ .arg = arg, .body = body } });
 }
 
-fn parseIdentifier(gpa: Allocator, gc: *Ast.GC, l: *Lexer, i: []const u8) Allocator.Error!?Ast.Node.Ref {
-    // We have a couple of cases.
-    // 1. i...) or ; or eof  ; return variable
-    // 2. i variable ; return application of i and var
-    // 3. i (lambda) ; return application of i and function
-    for (0..safety_bound) |_| {
-        if (l.peek() == .space) {
-            l.consume();
-            continue;
-        }
-        break;
-    } else @panic("loop safety counter exceeded");
-
-    var ret = try gc.make(gpa, .{ .variable = i });
-
-    // We have to iterate as to encapsulate with left-priority all arguments to
-    // a function application.
-    // ex: f x y z == ((f x) y) z
-    for (0..safety_bound) |_| {
-        const peeked = l.peek();
-
-        // case 1
-        if (peeked == .cparen or peeked == .comment or peeked == .end) {
-            return ret;
-        }
-
-        // case 2.
-        if (peeked.kindEql(.{ .ident = "" })) {
-            const variable = l.next().ident;
-            const variable_ref = try gc.make(gpa, .{ .variable = variable });
-            ret = try gc.make(gpa, .{ .app = .{ .lhs = ret, .rhs = variable_ref } });
-            continue;
-        }
-
-        // case 3.
-        if (peeked.kindEql(.lambda) or peeked.kindEql(.oparen)) {
-            l.consume(); // lambda symbol
-            const func = try parseFunction(gpa, gc, l) orelse return null;
-            ret = try gc.make(gpa, .{ .app = .{ .lhs = ret, .rhs = func } });
-            continue;
-        }
-
-        break;
-    } else @panic("loop safety counter exceeded");
-
-    return ret;
-}
-
-fn parseExpression(gpa: Allocator, gc: *Ast.GC, l: *Lexer) Allocator.Error!?Ast.Node.Ref {
+fn parsePrimary(gpa: Allocator, gc: *Ast.GC, l: *Lexer) Allocator.Error!?Ast.Node.Ref {
     const next = l.next();
     switch (next) {
-        .ident => |i| return try parseIdentifier(gpa, gc, l, i),
+        .ident => |i| return try gc.make(gpa, .{ .variable = i }),
         .lambda => return parseFunction(gpa, gc, l),
         .oparen => {
-            // Inner gets allocated via gc elsewhere, therefore no need to call
-            // `make`.
             const inner = try parseExpression(gpa, gc, l) orelse return null;
-
-            for (0..safety_bound) |_| {
-                if (l.peek() == .space) {
-                    l.consume();
-                    continue;
-                }
-                break;
-            } else @panic("loop safety counter exceeded");
-
-            // Either we have something else inside this paren, or we don't
-            // 1. (inner)     ; unnessecary wrapping of variable/application, return inner
-            // 2. (inner rhs) ; return application
-            // 3. (inner) rhs ; inner is a function => return application rhs
-
-            if (l.peek() == .cparen) {
-                if (gc.get(inner).?.* == .function) {
-                    // case 3.
-                    l.consume(); // cparen
-                    // If there is no rhs, then we are equivalent to case 1,
-                    // therefore return inner.
-                    const rhs = try parseExpression(gpa, gc, l) orelse return inner;
-                    return try gc.make(gpa, .{ .app = .{ .lhs = inner, .rhs = rhs } });
-                }
-
-                // case 1.
-                l.consume(); // cparen
-                return inner;
+            if (l.peek() != .cparen) {
+                std.log.err("unexpected token. expected ')', found: '{s}'\n", .{@tagName(l.next())});
+                return null;
             }
-
-            // case 2.
-            const rhs = try parseExpression(gpa, gc, l) orelse return null;
-            return try gc.make(gpa, .{ .app = .{ .lhs = inner, .rhs = rhs } });
+            l.consume();
+            return inner;
         },
-        .eq, .cparen, .separator, .space, .comment, .end, .illegal => {
+        .cparen, .space, .newline, .comment, .end => return null,
+        .eq, .separator, .illegal => {
             std.log.err("unexpected token. expected a primary token, found: '{s}'\n", .{@tagName(next)});
             return null;
         },
     }
 }
 
+fn parseExpression(gpa: Allocator, gc: *Ast.GC, l: *Lexer) Allocator.Error!?Ast.Node.Ref {
+    var lhs = try parsePrimary(gpa, gc, l) orelse return null;
+
+    for (0..safety_bound) |_| {
+        const tok = l.peek();
+        if (tok == .cparen or tok == .comment or tok == .end) return lhs;
+
+        const rhs = try parsePrimary(gpa, gc, l) orelse return lhs;
+        lhs = try gc.make(gpa, .{ .app = .{ .lhs = lhs, .rhs = rhs } });
+    } else @panic("loop safety counter exceeded");
+}
+
 const Parsed = struct { Ast, usize };
+
+fn skipLeadingTrivia(l: *Lexer) void {
+    while (true) {
+        switch (l.peek()) {
+            .space, .newline => l.consume(),
+            .comment => l.consume(),
+            .eq, .lambda, .oparen, .cparen, .separator, .end, .illegal, .ident => return,
+        }
+    }
+}
 
 fn parse(gpa: Allocator, input: []const u8) Allocator.Error!?Parsed {
     var gc = Ast.GC{};
     var l = Lexer.init(input);
+    skipLeadingTrivia(&l);
     const root = try parseExpression(gpa, &gc, &l) orelse return null;
     return .{ Ast{ .root_ref = root, .gc = gc }, l.cur };
+}
+
+fn repl(alloc: Allocator) !void {
+    const stdin = std.fs.File.stdin();
+    defer stdin.close();
+
+    var stdin_buf: [4096]u8 = undefined;
+    var stdin_reader = stdin.reader(&stdin_buf);
+
+    while (true) {
+        std.debug.print("@> ", .{});
+        const input = try stdin_reader.interface.takeDelimiter('\n') orelse continue;
+        if (std.mem.eql(u8, input, ":quit")) break;
+
+        var ast, _ = try parse(alloc, input) orelse continue;
+        defer ast.deinit(alloc);
+
+        const res = ast.eval(alloc) catch |e| switch (e) {
+            error.ExpectedFunction => {
+                std.log.err("expected a function, found non-function", .{});
+                continue;
+            },
+            error.OutOfMemory => return e,
+        } orelse {
+            std.debug.print("info: did not evaluate to a proper result\n", .{});
+            continue;
+        };
+
+        std.debug.print("{f}\n", .{try res.printable(alloc, &ast.gc)});
+    }
 }
 
 pub fn main() !void {
@@ -449,26 +435,47 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 
-    const f = std.fs.File.stdin();
+    var args = std.process.args();
+    _ = args.next();
+    const file_path_opt = args.next();
+    if (file_path_opt == null or file_path_opt.?.len == 0) {
+        try repl(alloc);
+        return;
+    }
+
+    const file_path = file_path_opt.?;
+
+    var f = try std.fs.cwd().openFile(file_path, .{});
     defer f.close();
 
-    var reader_buf: [4096]u8 = undefined;
-    var reader = f.reader(&reader_buf);
+    var file_buf: [4096]u8 = undefined;
+    var file_reader = f.reader(&file_buf);
 
+    const size = try file_reader.getSize();
+    const to_run = try file_reader.interface.readAlloc(alloc, size);
+    defer alloc.free(to_run);
+
+    var left: []const u8 = to_run;
     while (true) {
-        std.debug.print("@> ", .{});
-        const input = try reader.interface.takeDelimiter('\n') orelse continue;
-        if (std.mem.eql(u8, input, ":quit")) break;
-
-        var ast, _ = try parse(alloc, input) orelse continue;
+        const prev = left;
+        var ast, const pos = try parse(alloc, left) orelse break;
         defer ast.deinit(alloc);
 
-        const res = try ast.eval(alloc) orelse {
-            std.debug.print("info: did not evaluate to a proper result\n", .{});
+        left = left[pos..];
+
+        const node = ast.eval(alloc) catch |e| switch (e) {
+            error.ExpectedFunction => {
+                std.log.err("expected a function, found non-function in '{s}'", .{prev});
+                continue;
+            },
+            error.OutOfMemory => return e,
+        } orelse {
+            std.debug.print("no result for '{s}'\n", .{prev});
             continue;
         };
 
-        std.debug.print("{f}\n", .{try res.printable(alloc, &ast.gc)});
+        const printable = try node.printable(alloc, &ast.gc);
+        std.debug.print("{f}\n", .{printable});
     }
 }
 
