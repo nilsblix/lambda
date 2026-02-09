@@ -40,15 +40,19 @@ const Ast = struct {
     const GC = struct {
         buf: std.ArrayList(Node),
         gens: std.StringHashMap(Node.Ref),
+        sources: std.ArrayList([]u8),
 
         fn init(gpa: Allocator) GC {
             return .{
                 .buf = .empty,
                 .gens = .init(gpa),
+                .sources = .empty,
             };
         }
 
         fn deinit(self: *GC, gpa: Allocator) void {
+            for (self.sources.items) |source| gpa.free(source);
+            self.sources.deinit(gpa);
             self.gens.deinit();
             self.buf.deinit(gpa);
         }
@@ -139,23 +143,16 @@ const Ast = struct {
                     return body_ref;
                 },
                 // (\param.\inner_arg.inner_body) arg
-                // We need to replace all occurences of `param` in `inner_arg`
-                // and `inner_body` with `arg`.
+                // A lambda binder is always a variable name. We never substitute
+                // into the binder itself.
                 .function => |inner| {
-                    const new_inner_arg = new_inner_arg: {
-                        // TODO: Do we really have to heap allocate this
-                        // temporary thing? Feels like this is just a
-                        // limitation of the replace signature being dependant
-                        // on a bunch of refs.
-                        const tmp = try gc.make(gpa, .{ .variable = inner.arg });
-                        const ref = try replace(gpa, gc, param, tmp, arg_ref);
-                        const node = gc.get(ref);
-                        break :new_inner_arg node.?.variable;
-                    };
+                    // Shadowing: if the inner binder matches `param`, substitution
+                    // must stop at this lambda.
+                    if (std.mem.eql(u8, inner.arg, param)) return body_ref;
 
                     const new_inner_body = try replace(gpa, gc, param, inner.body, arg_ref);
                     const ret = Node{
-                        .function = .{ .arg = new_inner_arg, .body = new_inner_body },
+                        .function = .{ .arg = inner.arg, .body = new_inner_body },
                     };
                     return try gc.make(gpa, ret);
                 },
@@ -173,7 +170,7 @@ const Ast = struct {
             }
         }
 
-        const Error = error{ExpectedFunction, InvalidGen} || Allocator.Error;
+        const Error = error{ ExpectedFunction, InvalidGen } || Allocator.Error;
 
         fn evalFromRef(gpa: Allocator, gc: *GC, ref: Ref) Error!Ref {
             const node = gc.get(ref).?.*;
@@ -188,8 +185,20 @@ const Ast = struct {
                 },
                 .function => return try gc.make(gpa, node),
                 .app => |app| {
-                    const function_ref = try Node.evalFromRef(gpa, gc, app.lhs);
-                    const replacement_ref = try evalFromRef(gpa, gc, app.rhs);
+                    var function_ref = app.lhs;
+                    for (0..safety_bound) |_| {
+                        function_ref = try Node.evalFromRef(gpa, gc, function_ref);
+                        const f = gc.get(function_ref) orelse unreachable;
+                        switch (f.*) {
+                            .app => continue,
+                            .variable => |v| {
+                                if (gc.gens.get(v) != null) continue;
+                                break;
+                            },
+                            .function => break,
+                        }
+                    } else @panic("loop safety counter exceeded");
+                    const replacement_ref = app.rhs;
 
                     const f = gc.get(function_ref) orelse unreachable;
                     if (f.* != .function) return error.ExpectedFunction;
@@ -427,11 +436,7 @@ const ParsedMutable = union(enum) {
     expression: struct { Ast.Node.Ref, usize },
 };
 
-fn parseMutable(
-    gpa: Allocator,
-    gc: *Ast.GC,
-    input: []const u8
-) Allocator.Error!?ParsedMutable {
+fn parseMutable(gpa: Allocator, gc: *Ast.GC, input: []const u8) Allocator.Error!?ParsedMutable {
     var l = Lexer.init(input);
     skipLeadingTrivia(&l);
 
@@ -453,7 +458,7 @@ fn parseMutable(
     }
 
     const root = try parseExpression(gpa, gc, &l) orelse return null;
-    return ParsedMutable{ .expression = .{ root, copy.cur } };
+    return ParsedMutable{ .expression = .{ root, l.cur } };
 }
 
 fn executeMutable(gpa: Allocator, gc: *Ast.GC, path: []const u8) !void {
@@ -465,37 +470,45 @@ fn executeMutable(gpa: Allocator, gc: *Ast.GC, path: []const u8) !void {
 
     const size = try file_reader.getSize();
     const to_run = try file_reader.interface.readAlloc(gpa, size);
-    defer gpa.free(to_run);
+    try gc.sources.append(gpa, to_run);
 
     var left: []const u8 = to_run;
     while (true) {
         const prev = left;
 
         const parsed_mut = try parseMutable(gpa, gc, left) orelse break;
-        if (std.mem.eql(u8, @tagName(parsed_mut), "assignment")) continue;
-
-        const ref, const pos = parsed_mut.expression;
-
-        left = left[pos..];
-        var ast = Ast{ .root_ref = ref, .gc = gc.* };
-
-        const node = ast.eval(gpa) catch |e| switch (e) {
-            error.ExpectedFunction => {
-                std.log.err("expected a function, found non-function in '{s}'", .{prev});
+        const ref = switch (parsed_mut) {
+            .assignment => |a| {
+                left = left[a.@"2"..];
                 continue;
             },
-            error.InvalidGen => {
-                std.log.err("an unexpected gen was found", .{});
-                continue;
+            .expression => |e| blk: {
+                left = left[e.@"1"..];
+                break :blk e.@"0";
             },
-            error.OutOfMemory => return e,
-        } orelse {
-            std.debug.print("no result for '{s}'\n", .{prev});
-            continue;
         };
+        {
+            var ast = Ast{ .root_ref = ref, .gc = gc.* };
+            defer gc.* = ast.gc;
 
-        const printable = try node.printable(gpa, &ast.gc);
-        std.debug.print("{f}\n", .{printable});
+            const node = ast.eval(gpa) catch |e| switch (e) {
+                error.ExpectedFunction => {
+                    std.log.err("expected a function, found non-function in '{s}'", .{prev});
+                    continue;
+                },
+                error.InvalidGen => {
+                    std.log.err("an unexpected gen was found", .{});
+                    continue;
+                },
+                error.OutOfMemory => return e,
+            } orelse {
+                std.debug.print("no result for '{s}'\n", .{prev});
+                continue;
+            };
+
+            const printable = try node.printable(gpa, &ast.gc);
+            std.debug.print("{f}\n", .{printable});
+        }
     }
 }
 
@@ -511,34 +524,39 @@ fn repl(gpa: Allocator, gc: *Ast.GC) !void {
         const input = try stdin_reader.interface.takeDelimiter('\n') orelse continue;
         if (std.mem.eql(u8, input, ":q")) break;
 
-        const parsed_mut = try parseMutable(gpa, gc, input) orelse break;
+        const stable = try gpa.dupe(u8, input);
+        try gc.sources.append(gpa, stable);
+        const parsed_mut = try parseMutable(gpa, gc, stable) orelse break;
         if (std.mem.eql(u8, @tagName(parsed_mut), "assignment")) {
             const got = gc.get(parsed_mut.assignment.@"1").?;
             const printable = try got.printable(gpa, gc);
             const name = parsed_mut.assignment.@"0";
-            std.log.info("assigned {f} to {s}", .{printable, name});
+            std.log.info("assigned {f} to {s}", .{ printable, name });
             continue;
         }
 
         const ref, _ = parsed_mut.expression;
-        var ast = Ast{ .root_ref = ref, .gc = gc.* };
+        {
+            var ast = Ast{ .root_ref = ref, .gc = gc.* };
+            defer gc.* = ast.gc;
 
-        const res = ast.eval(gpa) catch |e| switch (e) {
-            error.ExpectedFunction => {
-                std.log.err("expected a function, found non-function", .{});
+            const res = ast.eval(gpa) catch |e| switch (e) {
+                error.ExpectedFunction => {
+                    std.log.err("expected a function, found non-function", .{});
+                    continue;
+                },
+                error.InvalidGen => {
+                    std.log.err("an unexpected gen was found", .{});
+                    continue;
+                },
+                error.OutOfMemory => return e,
+            } orelse {
+                std.log.info("did not evaluate to a proper result", .{});
                 continue;
-            },
-            error.InvalidGen => {
-                std.log.err("an unexpected gen was found", .{});
-                continue;
-            },
-            error.OutOfMemory => return e,
-        } orelse {
-            std.log.info("did not evaluate to a proper result", .{});
-            continue;
-        };
+            };
 
-        std.debug.print("{f}\n", .{try res.printable(gpa, &ast.gc)});
+            std.debug.print("{f}\n", .{try res.printable(gpa, &ast.gc)});
+        }
     }
 }
 
