@@ -522,7 +522,18 @@ fn repl(gpa: Allocator, gc: *Ast.GC) !void {
     while (true) {
         std.debug.print("@> ", .{});
         const input = try stdin_reader.interface.takeDelimiter('\n') orelse continue;
+
         if (std.mem.eql(u8, input, ":q")) break;
+        if (std.mem.eql(u8, input, ":list")) {
+            std.debug.print("({d}) stored values:\n", .{gc.gens.count()});
+            var iter = gc.gens.iterator();
+            while (iter.next()) |entry| {
+                const node = gc.get(entry.value_ptr.*) orelse continue;
+                const printable = try node.printable(gpa, gc);
+                std.debug.print("** {s} = {f}\n", .{entry.key_ptr.*, printable});
+            }
+            continue;
+        }
 
         const stable = try gpa.dupe(u8, input);
         try gc.sources.append(gpa, stable);

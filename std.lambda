@@ -1,0 +1,9 @@
+id = \x.x                          ;
+
+true = \x.y.x                      ;
+false = \x.y.y                     ;
+if = id                            ;
+
+pair = \x.y.f.f x y                ;
+fst = \p.p true                    ;
+snd = \p.p false                   ;
