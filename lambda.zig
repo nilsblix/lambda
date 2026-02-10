@@ -420,7 +420,7 @@ fn skipLeadingTrivia(l: *Lexer) void {
     } else @panic("loop safety counter exceeded");
 }
 
-fn parse(gpa: Allocator, input: []const u8) Allocator.Error!?Parsed {
+fn parse(gpa: Allocator, input: []const u8) Allocator.Error!Parsed {
     var gc = Ast.GC.init(gpa);
     errdefer gc.deinit(gpa);
 
@@ -512,6 +512,21 @@ fn executeMutable(gpa: Allocator, gc: *Ast.GC, path: []const u8) !void {
     }
 }
 
+fn handleTags(gc: *Ast.GC, tag: []const u8) !enum{ quit, next, nothing } {
+    if (std.mem.eql(u8, tag, ":q")) return .quit;
+    if (std.mem.eql(u8, tag, ":list")) {
+        std.debug.print("({d}) stored values:\n", .{gc.gens.count()});
+        var iter = gc.gens.iterator();
+        while (iter.next()) |entry| {
+            const view = Ast{ .root_ref = entry.value_ptr.*, .gc = gc.* };
+            std.debug.print("** {s} = {f}\n", .{ entry.key_ptr.*, view });
+        }
+        return .next;
+    }
+
+    return .nothing;
+}
+
 fn repl(gpa: Allocator, gc: *Ast.GC) !void {
     const stdin = std.fs.File.stdin();
     defer stdin.close();
@@ -523,24 +538,21 @@ fn repl(gpa: Allocator, gc: *Ast.GC) !void {
         std.debug.print("@> ", .{});
         const input = try stdin_reader.interface.takeDelimiter('\n') orelse continue;
 
-        if (std.mem.eql(u8, input, ":q")) break;
-        if (std.mem.eql(u8, input, ":list")) {
-            std.debug.print("({d}) stored values:\n", .{gc.gens.count()});
-            var iter = gc.gens.iterator();
-            while (iter.next()) |entry| {
-                const node = gc.get(entry.value_ptr.*) orelse continue;
-                const printable = try node.printable(gpa, gc);
-                std.debug.print("** {s} = {f}\n", .{entry.key_ptr.*, printable});
-            }
-            continue;
+        // FIXME: Why does it segfault when doing multiple :list in a row?
+        switch (try handleTags(gc, input)) {
+            .quit => break,
+            .next => continue,
+            .nothing => {},
         }
 
         const stable = try gpa.dupe(u8, input);
         try gc.sources.append(gpa, stable);
         const parsed_mut = try parseMutable(gpa, gc, stable) orelse break;
         if (std.mem.eql(u8, @tagName(parsed_mut), "assignment")) {
-            const got = gc.get(parsed_mut.assignment.@"1").?;
-            const printable = try got.printable(gpa, gc);
+            const printable = Ast{
+                .root_ref = parsed_mut.assignment.@"1",
+                .gc = gc.*,
+            };
             const name = parsed_mut.assignment.@"0";
             std.log.info("assigned {f} to {s}", .{ printable, name });
             continue;

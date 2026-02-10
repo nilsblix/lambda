@@ -1,0 +1,13 @@
+id = \x.x                          ;
+true = \x.y.x                      ;
+false = \x.y.y                     ;
+if = id                            ;
+pair = \x.y.f.f x y                ;
+fst = \p.p true                    ;
+snd = \p.p false                   ;
+
+if true 12 13                      ;
+if false 12 13                     ;
+
+fst (pair 12 13)                   ;
+(snd (fst (pair (pair 12 13) 34))) ;
