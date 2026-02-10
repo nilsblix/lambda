@@ -420,7 +420,7 @@ fn skipLeadingTrivia(l: *Lexer) void {
     } else @panic("loop safety counter exceeded");
 }
 
-fn parse(gpa: Allocator, input: []const u8) Allocator.Error!Parsed {
+fn parse(gpa: Allocator, input: []const u8) Allocator.Error!?Parsed {
     var gc = Ast.GC.init(gpa);
     errdefer gc.deinit(gpa);
 
